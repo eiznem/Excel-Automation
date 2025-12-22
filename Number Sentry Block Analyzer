@@ -1,0 +1,528 @@
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * VoApps — Number Sentry Blocked Streak Analyzer
+ * Version: 1.10.0  (skip non-”Success” rows)
+ * Last Updated: 2025-09-08
+ *
+ * WHAT IT DOES
+ *  • Reads ONLY row 1 (headers) and ONLY the required columns from the ACTIVE sheet:
+ *      Number | Carrier | Date | is_blocked | Entity | OBN Status | Preferred Business Name | Test Status
+ *  • **NEW:** Filters out any row whose Test Status is not "Success" (case-insensitive).
+ *  • Groups by (Number, Carrier) and counts consecutive **blocked test DAYS** (calendar dates).
+ *  • Outputs two brand-styled **Excel Tables**:
+ *      1) "Blocked Streaks"   — per (Number, Carrier) currently blocked, with streak details.
+ *      2) "Summary by Number" — per Number: carriers blocking, count, longest current streak.
+ *  • "Analyzer Log" sheet records run details & tips.
+ *
+ * HOW TO USE
+ * Download Number History report from Test Summary (Test History section): https://portal.numbersentry.com/test-summary/
+ *  1) Click the sheet that contains your data (make it ACTIVE).
+ *  2) Row 1 must include the headers above (any order; case-insensitive; underscores/hyphens/spaces OK).
+ *  3) Run the script. It creates/refreshes the 3 sheets and returns to your active sheet.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+function main(workbook: ExcelScript.Workbook) {
+    // ── Branding (strings only to avoid API aliasing/type issues)
+    const BRAND = {
+        fontName: "Montserrat",
+        fontSize: 11,
+        textColor: "#333333",
+        headerBg: "#16509B",         // Replace with your exact VoApps hex if needed
+        headerText: "#FFFFFF",
+        tableStyle: "TableStyleMedium9" // Any built-in Excel style name
+    };
+
+    const LOG_SHEET = "Analyzer Log";
+    const OUT_DETAIL_SHEET = "Blocked Streaks";
+    const OUT_SUMMARY_SHEET = "Summary by Number";
+
+    // ── Buffered logging (single write for performance)
+    const logs: string[] = [];
+    const log = (m: string) => logs.push(`[${new Date().toLocaleString()}] ${m}`);
+    log("===== VoApps — Number Sentry Blocked Streak Analyzer v1.10.0 =====");
+
+    // ── Use ACTIVE worksheet as input
+    const ws = workbook.getActiveWorksheet();
+    if (!ws) {
+        log("No active worksheet. Click your data tab, then run again.");
+        flushLogSheet(workbook, LOG_SHEET, logs);
+        return;
+    }
+    log(`Reading from ACTIVE sheet "${ws.getName()}"`);
+
+    // Size only (do NOT read all values on huge sheets)
+    const used = ws.getUsedRange();
+    if (!used) {
+        log("Used range is empty.");
+        flushLogSheet(workbook, LOG_SHEET, logs);
+        return;
+    }
+    const totalRows = used.getRowCount();
+    const totalCols = used.getColumnCount();
+    log(`Used range: ${totalRows} rows × ${totalCols} cols`);
+
+    if (totalRows < 2) {
+        log("No data rows (need header row + at least 1 data row).");
+        flushLogSheet(workbook, LOG_SHEET, logs);
+        return;
+    }
+
+    // ── Read HEADER ROW ONLY
+    const headerVals = ws.getRangeByIndexes(0, 0, 1, totalCols).getValues() as (string | number | boolean | Date | null)[][];
+    const headerRow = (headerVals && headerVals.length ? headerVals[0] : []) as (string | number | boolean | Date | null)[];
+
+    // Required headers (now explicitly includes Test Status)
+    const required: CanonHeader[] = [
+        "Number",
+        "Carrier",
+        "Date",
+        "is_blocked",
+        "Entity",
+        "OBN Status",
+        "Preferred Business Name",
+        "Test Status"
+    ];
+    const headerMap = mapHeadersFromRow1(headerRow, required);
+    const missing = required.filter((h) => headerMap[h] === undefined);
+    if (missing.length) {
+        log(`Could not find required headers in row 1: ${missing.join(", ")}`);
+        log("Tip: exact words not required; case/underscores/hyphens/spaces are normalized.");
+        flushLogSheet(workbook, LOG_SHEET, logs);
+        return;
+    }
+    log(`Header map: ${JSON.stringify(headerMap)}`);
+
+    // ── Read ONLY required columns (rows 2..N)
+    const dataRowCount = totalRows - 1;
+    const readCol = (colIdx: number) =>
+        ws.getRangeByIndexes(1, colIdx, dataRowCount, 1).getValues() as (string | number | boolean | Date | null)[][];
+
+    const numCol = readCol(headerMap["Number"]);
+    const carCol = readCol(headerMap["Carrier"]);
+    const dateCol = readCol(headerMap["Date"]);
+    const blkCol = readCol(headerMap["is_blocked"]);
+    const entCol = readCol(headerMap["Entity"]);
+    const obnCol = readCol(headerMap["OBN Status"]);
+    const pbnCol = readCol(headerMap["Preferred Business Name"]);
+    const tstCol = readCol(headerMap["Test Status"]);
+
+    // ── Build filtered records (skip where Test Status ≠ "Success")
+    const records: Rec[] = [];
+    for (let i = 0; i < dataRowCount; i++) {
+        if (!isSuccess(tstCol[i]?.[0])) continue; // <-- NEW filter
+
+        const numberStr = safeToString(numCol[i]?.[0]).trim();
+        const carrierStr = safeToString(carCol[i]?.[0]).trim();
+        const dateOnly = coerceDateOnly(dateCol[i]?.[0] as unknown);
+        const isBlocked = normalizeBlocked(blkCol[i]?.[0] as unknown);
+        const entity = safeToString(entCol[i]?.[0]).trim();
+        const obnStatus = safeToString(obnCol[i]?.[0]).trim();
+        const pbn = safeToString(pbnCol[i]?.[0]).trim();
+
+        if (!numberStr || !carrierStr || !dateOnly) continue;
+
+        records.push({
+            number: numberStr,
+            carrier: carrierStr,
+            date: dateOnly,
+            isBlocked,
+            entity,
+            obnStatus,
+            preferredBusinessName: pbn
+        });
+    }
+
+    if (records.length === 0) {
+        log('After filtering for Test Status = "Success", no usable rows remained.');
+        flushLogSheet(workbook, LOG_SHEET, logs);
+        return;
+    }
+    log(`Parsed records (Success only): ${records.length}`);
+
+    // ── Group by (Number, Carrier); rows sorted newest→oldest
+    const groups = groupByNumberCarrier(records);
+    log(`(Number, Carrier) groups: ${groups.length}`);
+
+    // ── Compute current blocked streaks
+    const details: DetailRow[] = [];
+    const summaryMap: Map<string, SummaryRow> = new Map();
+
+    for (const g of groups) {
+        const byDate: Map<string, DayStatus> = new Map();
+        let lastSeenKey = "";
+        const latestRec = g.rows[0];
+
+        for (const rec of g.rows) {
+            const key = ymd(rec.date);
+            const cur = byDate.get(key) ?? { date: rec.date, anyBlocked: false, anyRowCount: 0 };
+            cur.anyBlocked = cur.anyBlocked || rec.isBlocked === 1;
+            cur.anyRowCount += 1;
+            byDate.set(key, cur);
+            if (!lastSeenKey || key > lastSeenKey) lastSeenKey = key;
+        }
+
+        if (byDate.size === 0) continue;
+
+        const daysDesc = Array.from(byDate.keys()).sort((a, b) => b.localeCompare(a));
+        const latestKey = daysDesc[0];
+        const currentlyBlocked = byDate.get(latestKey)!.anyBlocked;
+
+        // Ensure per-number summary exists and keep the most recent meta
+        if (!summaryMap.has(g.number)) {
+            summaryMap.set(g.number, {
+                number: g.number,
+                entity: latestRec.entity,
+                obnStatus: latestRec.obnStatus,
+                preferredBusinessName: latestRec.preferredBusinessName,
+                currentlyBlockedCarriers: [],
+                currentlyBlockingCount: 0,
+                longestCurrentStreakDays: 0,
+                _metaLastSeenMs: latestRec.date.getTime()
+            });
+        } else {
+            const s = summaryMap.get(g.number)!;
+            if (latestRec.date.getTime() > s._metaLastSeenMs) {
+                s.entity = latestRec.entity;
+                s.obnStatus = latestRec.obnStatus;
+                s.preferredBusinessName = latestRec.preferredBusinessName;
+                s._metaLastSeenMs = latestRec.date.getTime();
+            }
+        }
+
+        if (!currentlyBlocked) continue;
+
+        // Count consecutive BLOCKED TEST DAYS from newest back
+        let streak = 0;
+        let evidence = 0;
+        for (const k of daysDesc) {
+            const ds = byDate.get(k)!;
+            if (!ds.anyBlocked) break;
+            streak++;
+            evidence += ds.anyRowCount;
+        }
+
+        const streakEndDate = parseYmd(latestKey);
+        const streakStartKey = daysDesc.slice(0, streak).reverse()[0];
+        const streakStartDate = streakStartKey ? parseYmd(streakStartKey) : streakEndDate;
+
+        details.push({
+            number: g.number,
+            entity: latestRec.entity,
+            preferredBusinessName: latestRec.preferredBusinessName,
+            obnStatus: latestRec.obnStatus,
+            carrier: g.carrier,
+            currentlyBlocked: "Yes",
+            streakDays: streak,
+            streakStartDate,
+            latestBlockedDate: streakEndDate,
+            lastSeenDate: parseYmd(lastSeenKey),
+            evidenceRowCount: evidence
+        });
+
+        const summ = summaryMap.get(g.number)!;
+        summ.currentlyBlockedCarriers.push(g.carrier);
+        summ.currentlyBlockingCount = summ.currentlyBlockedCarriers.length;
+        if (streak > summ.longestCurrentStreakDays) summ.longestCurrentStreakDays = streak;
+    }
+
+    // ── Output: Blocked Streaks (Excel TABLE with brand styling)
+    const detailHeaders = [
+        "Number",
+        "Entity",
+        "Preferred Business Name",
+        "OBN Status",
+        "Carrier",
+        "Currently Blocked",
+        "Current Blocked Streak (test days)",
+        "Streak Start Date",
+        "Latest Blocked Date",
+        "Last Seen Date (any status)",
+        "Evidence Rows (in streak)"
+    ];
+    const detailRows = details.map((d): (string | number | boolean)[] => [
+        d.number,
+        d.entity,
+        d.preferredBusinessName,
+        d.obnStatus,
+        d.carrier,
+        d.currentlyBlocked,
+        d.streakDays,
+        excelSerial(d.streakStartDate),
+        excelSerial(d.latestBlockedDate),
+        excelSerial(d.lastSeenDate),
+        d.evidenceRowCount
+    ]);
+
+    writeTableAsStyledTable(workbook, OUT_DETAIL_SHEET, detailHeaders, detailRows, BRAND);
+    formatColumns(workbook, OUT_DETAIL_SHEET, { dateCols: [8, 9, 10], intCols: [7, 11] });
+
+    // ── Output: Summary by Number (Excel TABLE with brand styling)
+    const summaryHeaders = [
+        "Number",
+        "Entity",
+        "Preferred Business Name",
+        "OBN Status",
+        "Currently Blocking Carriers",
+        "Currently Blocking (count)",
+        "Longest Current Streak (test days)"
+    ];
+    const summaryRows = Array.from(summaryMap.values()).map((s): (string | number | boolean)[] => [
+        s.number,
+        s.entity ?? "",
+        s.preferredBusinessName ?? "",
+        s.obnStatus ?? "",
+        s.currentlyBlockedCarriers.join(", "),
+        s.currentlyBlockingCount,
+        s.longestCurrentStreakDays
+    ]);
+
+    writeTableAsStyledTable(workbook, OUT_SUMMARY_SHEET, summaryHeaders, summaryRows, BRAND);
+    formatColumns(workbook, OUT_SUMMARY_SHEET, { intCols: [6, 7] });
+
+    log(`Details rows written: ${detailRows.length}`);
+    log(`Summary rows written: ${summaryRows.length}`);
+    log('Filter applied: only rows with Test Status = "Success" were analyzed.');
+    flushLogSheet(workbook, LOG_SHEET, logs);
+    ws.activate();
+}
+
+/*────────────────────────────── Types ───────────────────────────────*/
+
+type CanonHeader =
+    | "Number"
+    | "Carrier"
+    | "Date"
+    | "is_blocked"
+    | "Entity"
+    | "OBN Status"
+    | "Preferred Business Name"
+    | "Test Status";
+
+type Rec = {
+    number: string;
+    carrier: string;
+    date: Date;
+    isBlocked: 0 | 1;
+    entity: string;
+    obnStatus: string;
+    preferredBusinessName: string;
+};
+
+type Group = { number: string; carrier: string; rows: Rec[] };
+
+type DayStatus = { date: Date; anyBlocked: boolean; anyRowCount: number };
+
+type DetailRow = {
+    number: string;
+    entity: string;
+    preferredBusinessName: string;
+    obnStatus: string;
+    carrier: string;
+    currentlyBlocked: "Yes" | "No";
+    streakDays: number;
+    streakStartDate: Date;
+    latestBlockedDate: Date;
+    lastSeenDate: Date;
+    evidenceRowCount: number;
+};
+
+type SummaryRow = {
+    number: string;
+    entity?: string;
+    obnStatus?: string;
+    preferredBusinessName?: string;
+    currentlyBlockedCarriers: string[];
+    currentlyBlockingCount: number;
+    longestCurrentStreakDays: number;
+    _metaLastSeenMs: number; // internal latest-meta tracker
+};
+
+/*──────────────────────── Header & parsing helpers ─────────────────*/
+
+function mapHeadersFromRow1(
+    headerRow: (string | number | boolean | Date | null)[],
+    needed: CanonHeader[]
+): Record<CanonHeader, number> {
+    const normRow: string[] = (headerRow ?? []).map((h) => normHeader(safeToString(h)));
+    const index: Record<string, number> = {};
+    for (let i = 0; i < normRow.length; i++) {
+        const key = normRow[i];
+        if (key) index[key] = i;
+    }
+    const out: Partial<Record<CanonHeader, number>> = {};
+    needed.forEach((canon) => {
+        const key = normHeader(canon);
+        if (index[key] !== undefined) out[canon] = index[key];
+    });
+    return out as Record<CanonHeader, number>;
+}
+
+function normHeader(s: string): string {
+    return (s ?? "")
+        .toString()
+        .replace(/\uFEFF/g, "")          // BOM
+        .replace(/[\u200B-\u200D]/g, "") // zero-width chars
+        .replace(/\u00A0/g, " ")         // NBSP → space
+        .toLowerCase()
+        .replace(/[_\-]+/g, " ")         // underscores/hyphens → space
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+/** Accepts string/Date/Excel-serial → returns a midnight Date (local), or null. */
+function coerceDateOnly(v: unknown): Date | null {
+    if (v instanceof Date && !isNaN(v.getTime())) {
+        return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+    }
+    if (typeof v === "number" && isFinite(v)) {
+        const epoch = Date.UTC(1899, 11, 30);
+        const ms = epoch + v * 86400000;
+        const dt = new Date(ms);
+        return new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+    }
+    if (typeof v === "string") {
+        const tryParse = new Date(v);
+        if (!isNaN(tryParse.getTime())) {
+            return new Date(tryParse.getFullYear(), tryParse.getMonth(), tryParse.getDate());
+        }
+    }
+    return null;
+}
+
+/** 1/"1"/true/"true" → 1; else → 0 */
+function normalizeBlocked(v: unknown): 0 | 1 {
+    return (v === 1 || v === "1" || v === true || v === "true") ? 1 : 0;
+}
+
+/** Treat only text "success" (any case) as true. Everything else is false. */
+function isSuccess(v: unknown): boolean {
+    if (typeof v === "string") return v.trim().toLowerCase() === "success";
+    return false;
+}
+
+/** JS Date → Excel serial (numbers only for setValues) */
+function excelSerial(d: Date): number {
+    const epoch = Date.UTC(1899, 11, 30);
+    const utc = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+    return Math.round((utc - epoch) / 86400000);
+}
+
+function safeToString(v: unknown): string { return (v === null || v === undefined) ? "" : String(v); }
+function ymd(d: Date): string {
+    const y = d.getFullYear();
+    const m = (d.getMonth() + 1).toString().padStart(2, "0");
+    const day = d.getDate().toString().padStart(2, "0");
+    return `${y}-${m}-${day}`;
+}
+function parseYmd(s: string): Date {
+    const [y, m, d] = s.split("-").map((x) => Number(x));
+    return new Date(y, m - 1, d);
+}
+
+/*──────────────────────── Grouping helper ─────────────────────────*/
+
+function groupByNumberCarrier(records: Rec[]): Group[] {
+    const map: Map<string, Group> = new Map();
+    for (const r of records) {
+        const key = `${r.number}||${r.carrier}`;
+        if (!map.has(key)) map.set(key, { number: r.number, carrier: r.carrier, rows: [] });
+        map.get(key)!.rows.push(r);
+    }
+    const groups = Array.from(map.values());
+    groups.forEach((g) => g.rows.sort((a, b) => b.date.getTime() - a.date.getTime())); // newest→oldest
+    return groups;
+}
+
+/*──────────────────── Output: write & style as Excel Table ─────────*/
+
+function writeTableAsStyledTable(
+    workbook: ExcelScript.Workbook,
+    sheetName: string,
+    headers: string[],
+    rows: (string | number | boolean)[][],
+    brand: { fontName: string; fontSize: number; textColor: string; headerBg: string; headerText: string; tableStyle: string }
+): void {
+    // (Re)create worksheet
+    let ws = workbook.getWorksheet(sheetName);
+    if (ws) ws.delete();
+    ws = workbook.addWorksheet(sheetName);
+
+    // Write values
+    const all: (string | number | boolean)[][] = [headers, ...(rows ?? [])];
+    const rCount = all.length;
+    const cCount = headers.length;
+    ws.getRangeByIndexes(0, 0, rCount, cCount).setValues(all);
+
+    // Create Table spanning the written range
+    const lastCell = `${colToA1(cCount)}${rCount}`;
+    const tbl = ws.addTable(`A1:${lastCell}`, true);
+    tbl.setPredefinedTableStyle(brand.tableStyle);
+    tbl.setShowBandedRows(true);
+
+    // Apply brand fonts & colors in bulk
+    const allRange = tbl.getRange();
+    const hdr = tbl.getHeaderRowRange();
+
+    const fmt = allRange.getFormat();
+    fmt.getFont().setName(brand.fontName);
+    fmt.getFont().setSize(brand.fontSize);
+    fmt.getFont().setColor(brand.textColor);
+
+    const hfmt = hdr.getFormat();
+    hfmt.getFont().setBold(true);
+    hfmt.getFont().setName(brand.fontName);
+    hfmt.getFont().setColor(brand.headerText);
+    hfmt.getFill().setColor(brand.headerBg);
+
+    // Autofit and freeze
+    const used = ws.getUsedRange();
+    if (used) used.getFormat().autofitColumns();
+    ws.getFreezePanes().freezeRows(1);
+}
+
+/** Number → Excel column letters (1→A, 27→AA). */
+function colToA1(n: number): string {
+    let s = "";
+    while (n > 0) {
+        const m = (n - 1) % 26;
+        s = String.fromCharCode(65 + m) + s;
+        n = Math.floor((n - 1) / 26);
+    }
+    return s;
+}
+
+/*──────────────────────── Light number/date formatting ─────────────*/
+
+function formatColumns(
+    workbook: ExcelScript.Workbook,
+    sheetName: string,
+    opts: { dateCols?: number[]; intCols?: number[] }
+): void {
+    const ws = workbook.getWorksheet(sheetName);
+    if (!ws) return;
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    (opts.dateCols ?? []).forEach((c) => {
+        ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1).setNumberFormatLocal("m/d/yyyy");
+    });
+    (opts.intCols ?? []).forEach((c) => {
+        ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1).setNumberFormatLocal("0");
+    });
+}
+
+/*──────────────────────── Log writer ───────────────────────────────*/
+
+function flushLogSheet(workbook: ExcelScript.Workbook, name: string, lines: string[]): void {
+    let s = workbook.getWorksheet(name);
+    if (s) s.delete();
+    s = workbook.addWorksheet(name);
+    const out: (string | number | boolean)[][] = [["Log"], ...lines.map((l) => [l])];
+    s.getRangeByIndexes(0, 0, out.length, 1).setValues(out);
+    s.getRange("A1").getFormat().getFont().setBold(true);
+    s.getFreezePanes().freezeRows(1);
+}
