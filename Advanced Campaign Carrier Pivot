@@ -1,0 +1,537 @@
+// ======================================================================
+// Carrier Results Pivot Builder (v2.0.4)
+//
+// WHAT THIS SCRIPT DOES
+// ---------------------
+// 1) Uses the full UsedRange of the *active* sheet as a source table.
+// 2) Builds a PivotTable on a new sheet called "Carrier Pivot":
+//      Rows:    voapps_carrier
+//      Columns: voapps_result (filtered to 4 result types below)
+//      Values:  Count of voapps_result
+// 3) Forces *only* these voapps_result column labels to show:
+//      - "Successfully delivered"
+//      - "Unsuccessful delivery attempt"
+//      - "Voicemail full"
+//      - "Voicemail not setup"
+//    (Anything else, like "Running", is hidden.)
+// 4) Places a summary block to the RIGHT of the pivot with:
+//      Carrier | Success Rate | Delivered | Unsuccessful
+//    - Success Rate = Delivered / (Delivered + Unsuccessful)
+//    - Unsuccessful = sum of:
+//        "Unsuccessful delivery attempt",
+//        "Voicemail full",
+//        "Voicemail not setup"
+//    - Each GETPIVOTDATA is wrapped in IFERROR, so if a result type
+//      is missing from the pivot, it’s treated as 0 (no errors).
+//    - NO GRAND TOTAL ROW in the summary block.
+// 5) Extracts the campaign ID from workbook name like
+//      "...campaign_1985440..." -> "Campaign 1985440"
+//    and shows that as a title above the summary block.
+// 6) Turns off Row / Column Grand Totals.
+// 7) Makes all text on the "Carrier Pivot" sheet #0D053F (dark blue).
+// 8) Clears background fill on the *pivot area* itself (no banding).
+// 9) Optionally hides the captions "Count of voapps_result",
+//    "Column Labels", and "Row Labels" by setting their font to white.
+// 10) Colors the "Carrier Pivot" tab #FF4B7D and activates it.
+//
+// CONFIG BLOCK
+// ------------
+// Flip booleans in CONFIG and the gridline toggles below to tweak
+// behavior without touching the main logic.
+// ======================================================================
+
+function main(workbook: ExcelScript.Workbook) {
+	// --------------------------------------------------------------------
+	// Global configuration toggles (non-pivot-specific)
+	// --------------------------------------------------------------------
+	const DISABLE_GRIDLINES: boolean = true;         // Turn off Excel gridlines on pivot sheet
+	const DISABLE_SOURCE_GRIDLINES: boolean = false; // Optional: turn off gridlines on source sheet too
+
+	// --------------------------------------------------------------------
+	// CONFIG – flip these to true/false as desired
+	// --------------------------------------------------------------------
+	const CONFIG = {
+		/** Recreate the "Carrier Pivot" sheet each time (delete old if present). */
+		recreateCarrierPivotSheet: true,
+
+		/** Name of the pivot sheet to create/use. */
+		pivotSheetName: "Carrier Pivot",
+
+		/** Allowed voapps_result values to KEEP as pivot column labels. */
+		allowedResults: [
+			"Successfully delivered",
+			"Unsuccessful delivery attempt",
+			"Voicemail full",
+			"Voicemail not setup"
+		],
+
+		/** Turn off Row Grand Totals on the PivotTable. */
+		hideRowGrandTotals: true,
+
+		/** Turn off Column Grand Totals on the PivotTable. */
+		hideColumnGrandTotals: true,
+
+		/** Make all text on the pivot sheet dark blue (#0D053F). */
+		makeAllTextDarkBlue: true,
+
+		/** Clear any background fill on the pivot table area. */
+		clearPivotFill: true,
+
+		/**
+		 * Hide the captions "Count of voapps_result", "Column Labels",
+		 * "Row Labels" by setting their font color to white.
+		 * (Relies on the pivot starting at A3.)
+		 */
+		hidePivotCaptionsByColor: true,
+
+		/** Color the "Carrier Pivot" tab pink (#FF4B7D) and activate it. */
+		colorAndActivatePivotSheet: true
+	};
+
+	// --------------------------------------------------------------------
+	// Color constants
+	// --------------------------------------------------------------------
+	const DARK_BLUE = "#0D053F";
+	const PINK = "#FF4B7D";
+	const WHITE = "#FFFFFF";
+
+	// --------------------------------------------------------------------
+	// 1) Prep source table from active sheet
+	// --------------------------------------------------------------------
+	const sourceSheet = workbook.getActiveWorksheet();
+	const usedRange = sourceSheet.getUsedRange();
+
+	if (!usedRange) {
+		throw new Error("No used range found on the active sheet.");
+	}
+
+	// Treat the UsedRange as a table (first row = headers)
+	const sourceTable = workbook.addTable(usedRange, true);
+
+	// --------------------------------------------------------------------
+	// 2) Create / reset "Carrier Pivot" sheet
+	// --------------------------------------------------------------------
+	let pivotSheet: ExcelScript.Worksheet;
+	if (CONFIG.recreateCarrierPivotSheet) {
+		try {
+			const existing = workbook.getWorksheet(CONFIG.pivotSheetName);
+			if (existing) {
+				existing.delete();
+			}
+		} catch (e) {
+			// Sheet did not exist – nothing to delete.
+		}
+		pivotSheet = workbook.addWorksheet(CONFIG.pivotSheetName);
+	} else {
+		let existing: ExcelScript.Worksheet;
+		try {
+			existing = workbook.getWorksheet(CONFIG.pivotSheetName);
+		} catch (e) {
+			existing = workbook.addWorksheet(CONFIG.pivotSheetName);
+		}
+		pivotSheet = existing;
+		pivotSheet.getUsedRange()?.clear(ExcelScript.ClearApplyTo.all);
+	}
+
+	// --------------------------------------------------------------------
+	// 3) Create PivotTable
+	// --------------------------------------------------------------------
+	const pivotAnchor = pivotSheet.getRange("A3");
+
+	// Make pivot name unique to avoid conflicts across runs.
+	const pivotName = "CarrierResultsPivot_" + Date.now().toString();
+
+	const pivotTable = workbook.addPivotTable(
+		pivotName,
+		sourceTable,
+		pivotAnchor
+	);
+
+	// Row: voapps_carrier
+	const carrierHierarchy = pivotTable.getHierarchy("voapps_carrier");
+	pivotTable.addRowHierarchy(carrierHierarchy);
+
+	// Data + Columns: voapps_result (Count)
+	const resultHierarchy = pivotTable.getHierarchy("voapps_result");
+	pivotTable.addDataHierarchy(resultHierarchy);
+	pivotTable.addColumnHierarchy(resultHierarchy);
+
+	const resultColumnHierarchy =
+		pivotTable.getColumnHierarchy("voapps_result");
+
+	// --------------------------------------------------------------------
+	// 3a) Layout options: hide grand totals
+	// --------------------------------------------------------------------
+	const layout = pivotTable.getLayout();
+
+	if (CONFIG.hideRowGrandTotals) {
+		layout.setShowRowGrandTotals(false);
+	}
+	if (CONFIG.hideColumnGrandTotals) {
+		layout.setShowColumnGrandTotals(false);
+	}
+
+	// --------------------------------------------------------------------
+	// 3b) Filter column labels to only the allowed voapps_result values
+	// --------------------------------------------------------------------
+	const resultField = resultColumnHierarchy.getPivotField("voapps_result");
+	if (resultField) {
+		const items = resultField.getItems();
+		const allowed = CONFIG.allowedResults as string[];
+
+		items.forEach((item: ExcelScript.PivotItem) => {
+			const name = item.getName();
+			const keep = allowed.indexOf(name) !== -1;
+			item.setVisible(keep);
+		});
+	}
+
+	// --------------------------------------------------------------------
+	// 4) Key pivot ranges and indices
+	// --------------------------------------------------------------------
+	const pivotRange = layout.getRange();
+
+	const pivotStartRow = pivotRange.getRowIndex();    // e.g., A3 -> 2
+	const pivotStartCol = pivotRange.getColumnIndex(); // e.g., A3 -> 0
+	const pivotColCount = pivotRange.getColumnCount();
+	const pivotRowCount = pivotRange.getRowCount();    // height of pivot area
+
+	// Row labels (carriers) – each row is a carrier (no row grand totals)
+	const rowLabelRange = layout.getRowLabelRange();
+	const rowLabelStartRow = rowLabelRange.getRowIndex();
+	const rowLabelRowCount = rowLabelRange.getRowCount();
+	const dataRowCount = rowLabelRowCount;
+	const hasDataRows = dataRowCount > 0;
+
+	// Column labels – used to locate numeric body
+	const columnLabelRange = layout.getColumnLabelRange();
+	const dataStartColIndex = columnLabelRange.getColumnIndex();
+	const dataColCount = columnLabelRange.getColumnCount();
+
+	// Header row for pivot (Row Labels / Column Labels)
+	const headerRowIndex = pivotStartRow + 1;
+
+	// First data row = first row label
+	const firstDataRowIndex = rowLabelStartRow;
+
+	// R1C1 anchor for GETPIVOTDATA – pick top-left cell inside pivot
+	const anchorRowR1C1 = pivotStartRow + 1;
+	const anchorColR1C1 = pivotStartCol + 1;
+
+	// Column index of the row labels (carriers) inside the pivot
+	const rowLabelColR1C1 = pivotStartCol + 1;
+
+	// --------------------------------------------------------------------
+	// 5) Build summary block to the RIGHT of the pivot
+	//
+	// Columns:
+	//   Carrier      | Success Rate | Delivered | Unsuccessful
+	// --------------------------------------------------------------------
+	// Add a spacer column between the pivot and the summary block
+	const spacerColIndex: number = pivotStartCol + pivotColCount; // empty column right after pivot
+
+	const carrierSummaryColIndex: number = spacerColIndex + 1; // summary starts one column after spacer
+	const successColIndex: number = carrierSummaryColIndex + 1;
+	const deliveredColIndex: number = carrierSummaryColIndex + 2;
+	const unsuccessfulColIndex: number = carrierSummaryColIndex + 3;
+	const summaryColCount: number = 4;
+
+	// Make the spacer column narrow and clear any content/format
+	const spacerRange = pivotSheet.getRangeByIndexes(
+		pivotStartRow,          // start at top of pivot
+		spacerColIndex,
+		pivotRowCount,          // only cover the height of the pivot
+		1
+	);
+	spacerRange.clear(ExcelScript.ClearApplyTo.all);
+	spacerRange.getFormat().setColumnWidth(10); // super skinny spacer
+
+	// 5a) Campaign title row – ONE row above summary headers
+	const campaignTitleRowIndex = headerRowIndex - 1;
+
+	// Extract campaign ID from workbook name (pattern: "campaign_1234567")
+	const wbName = workbook.getName();
+	const campaignMatch = wbName.match(/campaign_(\d{7})/i);
+	const campaignId = campaignMatch ? campaignMatch[1] : "";
+	const campaignLabel = campaignId ? `Campaign ${campaignId}` : "Campaign";
+
+	// Clear old summary region (title + header + data rows)
+	const summaryClearHeight = rowLabelRowCount + 2; // title + header + data rows
+	const summaryClearRange = pivotSheet.getRangeByIndexes(
+		campaignTitleRowIndex,
+		carrierSummaryColIndex,
+		summaryClearHeight,
+		summaryColCount
+	);
+	summaryClearRange.clear(ExcelScript.ClearApplyTo.all);
+
+	// Campaign title (merged across 4 columns)
+	const campaignTitleRange = pivotSheet.getRangeByIndexes(
+		campaignTitleRowIndex,
+		carrierSummaryColIndex,
+		1,
+		summaryColCount
+	);
+	campaignTitleRange.merge(true);
+	campaignTitleRange.setValue(campaignLabel);
+
+	const campaignTitleFormat = campaignTitleRange.getFormat();
+	campaignTitleFormat.getFont().setBold(true);
+	campaignTitleFormat.setHorizontalAlignment(
+		ExcelScript.HorizontalAlignment.center
+	);
+	campaignTitleFormat.getFill().setColor(WHITE);
+	campaignTitleFormat.getFont().setColor(DARK_BLUE);
+
+	// Draw a thick dark-blue border around the title
+	const titleEdges: ExcelScript.BorderIndex[] = [
+		ExcelScript.BorderIndex.edgeTop,
+		ExcelScript.BorderIndex.edgeBottom,
+		ExcelScript.BorderIndex.edgeLeft,
+		ExcelScript.BorderIndex.edgeRight
+	];
+	for (const edge of titleEdges) {
+		const border = campaignTitleFormat.getRangeBorder(edge);
+		border.setStyle(ExcelScript.BorderLineStyle.continuous);
+		border.setColor(DARK_BLUE);
+		border.setWeight(ExcelScript.BorderWeight.thick);
+	}
+
+	// 5b) Headers for summary block (same row as pivot headers)
+	const carrierHeaderCell = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		carrierSummaryColIndex,
+		1,
+		1
+	);
+	carrierHeaderCell.setValue("Carrier");
+	carrierHeaderCell.getFormat().getFont().setBold(true);
+
+	const successHeaderCell = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		successColIndex,
+		1,
+		1
+	);
+	successHeaderCell.setValue("Success Rate");
+	successHeaderCell.getFormat().getFont().setBold(true);
+
+	const deliveredHeaderCell = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		deliveredColIndex,
+		1,
+		1
+	);
+	deliveredHeaderCell.setValue("Delivered");
+	deliveredHeaderCell.getFormat().getFont().setBold(true);
+
+	const unsuccessfulHeaderCell = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		unsuccessfulColIndex,
+		1,
+		1
+	);
+	unsuccessfulHeaderCell.setValue("Unsuccessful");
+	unsuccessfulHeaderCell.getFormat().getFont().setBold(true);
+
+	// 5c) Per-carrier formulas (NO grand total row)
+	if (hasDataRows) {
+		// Carrier column – copy of row label
+		const firstCarrierCell = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			carrierSummaryColIndex,
+			1,
+			1
+		);
+		const carrierFormulaR1C1 = `=RC${rowLabelColR1C1}`;
+		firstCarrierCell.setFormulaR1C1(carrierFormulaR1C1);
+
+		const carrierFillRange = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			carrierSummaryColIndex,
+			dataRowCount,
+			1
+		);
+		firstCarrierCell.autoFill(
+			carrierFillRange.getAddress(),
+			ExcelScript.AutoFillType.fillDefault
+		);
+
+		// Success Rate column – uses LET so missing result types are treated as 0
+		const firstSuccessCell = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			successColIndex,
+			1,
+			1
+		);
+
+		const successFormulaR1C1 =
+			`=LET(` +
+			`del,IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Successfully delivered","voapps_carrier",RC${rowLabelColR1C1}),0),` +
+			`u1,IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Unsuccessful delivery attempt","voapps_carrier",RC${rowLabelColR1C1}),0),` +
+			`u2,IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Voicemail full","voapps_carrier",RC${rowLabelColR1C1}),0),` +
+			`u3,IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Voicemail not setup","voapps_carrier",RC${rowLabelColR1C1}),0),` +
+			`total,del+u1+u2+u3,` +
+			`IF(total=0,"",del/total))`;
+
+		firstSuccessCell.setFormulaR1C1(successFormulaR1C1);
+
+		const successFillRange = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			successColIndex,
+			dataRowCount,
+			1
+		);
+		firstSuccessCell.autoFill(
+			successFillRange.getAddress(),
+			ExcelScript.AutoFillType.fillDefault
+		);
+
+		// Delivered column – Successfully delivered
+		const firstDeliveredCell = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			deliveredColIndex,
+			1,
+			1
+		);
+		const deliveredFormulaR1C1 =
+			`=IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Successfully delivered","voapps_carrier",RC${rowLabelColR1C1}),0)`;
+		firstDeliveredCell.setFormulaR1C1(deliveredFormulaR1C1);
+
+		const deliveredFillRange = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			deliveredColIndex,
+			dataRowCount,
+			1
+		);
+		firstDeliveredCell.autoFill(
+			deliveredFillRange.getAddress(),
+			ExcelScript.AutoFillType.fillDefault
+		);
+
+		// Unsuccessful column – sum of three buckets
+		const firstUnsuccessfulCell = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			unsuccessfulColIndex,
+			1,
+			1
+		);
+		const unsuccessfulFormulaR1C1 =
+			`=IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Unsuccessful delivery attempt","voapps_carrier",RC${rowLabelColR1C1}),0)+` +
+			`IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Voicemail full","voapps_carrier",RC${rowLabelColR1C1}),0)+` +
+			`IFERROR(GETPIVOTDATA("voapps_result",R${anchorRowR1C1}C${anchorColR1C1},` +
+			`"voapps_result","Voicemail not setup","voapps_carrier",RC${rowLabelColR1C1}),0)`;
+		firstUnsuccessfulCell.setFormulaR1C1(unsuccessfulFormulaR1C1);
+
+		const unsuccessfulFillRange = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			unsuccessfulColIndex,
+			dataRowCount,
+			1
+		);
+		firstUnsuccessfulCell.autoFill(
+			unsuccessfulFillRange.getAddress(),
+			ExcelScript.AutoFillType.fillDefault
+		);
+	}
+
+	// --------------------------------------------------------------------
+	// 6) Number formats for summary + pivot body
+	// --------------------------------------------------------------------
+	const totalSummaryRows = hasDataRows ? dataRowCount + 1 : 1; // header + data
+
+	// Success Rate as 0.0%
+	const successColumnRange = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		successColIndex,
+		totalSummaryRows,
+		1
+	);
+	successColumnRange.setNumberFormat("0.0%");
+
+	// Delivered & Unsuccessful as #,##0
+	const deliveredColumnRange = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		deliveredColIndex,
+		totalSummaryRows,
+		1
+	);
+	deliveredColumnRange.setNumberFormat("#,##0");
+
+	const unsuccessfulColumnRange = pivotSheet.getRangeByIndexes(
+		headerRowIndex,
+		unsuccessfulColIndex,
+		totalSummaryRows,
+		1
+	);
+	unsuccessfulColumnRange.setNumberFormat("#,##0");
+
+	// Pivot numeric body as #,##0
+	if (hasDataRows && dataColCount > 0) {
+		const dataBodyRange = pivotSheet.getRangeByIndexes(
+			firstDataRowIndex,
+			dataStartColIndex,
+			dataRowCount,
+			dataColCount
+		);
+		dataBodyRange.setNumberFormat("#,##0");
+	}
+
+	// --------------------------------------------------------------------
+	// 7) Auto-fit columns on pivot sheet
+	// --------------------------------------------------------------------
+	const finalUsedRange = pivotSheet.getUsedRange();
+	finalUsedRange?.getFormat().autofitColumns();
+
+	// --------------------------------------------------------------------
+	// 8) Global text color
+	// --------------------------------------------------------------------
+	if (CONFIG.makeAllTextDarkBlue) {
+		const allSheetRange = pivotSheet.getUsedRange();
+		allSheetRange?.getFormat().getFont().setColor(DARK_BLUE);
+	}
+
+	// --------------------------------------------------------------------
+	// 9) Clear pivot background fill (no banding)
+	// --------------------------------------------------------------------
+	if (CONFIG.clearPivotFill) {
+		pivotRange.getFormat().getFill().clear();
+	}
+
+	// --------------------------------------------------------------------
+	// 10) Hide pivot captions by setting font to white
+	//      ("Count of voapps_result", "Column Labels", "Row Labels")
+	//      Assumes pivot anchor at A3.
+	// --------------------------------------------------------------------
+	if (CONFIG.hidePivotCaptionsByColor) {
+		pivotSheet.getRange("A3").getFormat().getFont().setColor(WHITE);
+		pivotSheet.getRange("B3").getFormat().getFont().setColor(WHITE);
+		pivotSheet.getRange("A4").getFormat().getFont().setColor(WHITE);
+	}
+
+	// --------------------------------------------------------------------
+	// 11) Disable gridlines if selected
+	// --------------------------------------------------------------------
+	if (DISABLE_GRIDLINES) {
+		pivotSheet.setShowGridlines(false);
+	}
+
+	if (DISABLE_SOURCE_GRIDLINES) {
+		sourceSheet.setShowGridlines(false);
+	}
+
+	// --------------------------------------------------------------------
+	// 12) Color and activate pivot sheet
+	// --------------------------------------------------------------------
+	if (CONFIG.colorAndActivatePivotSheet) {
+		pivotSheet.setTabColor(PINK);
+		pivotSheet.activate();
+	}
+}
