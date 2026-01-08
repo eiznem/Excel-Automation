@@ -1,0 +1,1063 @@
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * VoApps — Number History Trend Analyzer
+ * Version: 1.0.4
+ * Last Updated: 2026-01-08
+ *
+ * CHANGE SUMMARY (v1.0.4)
+ * • Removed optional date window filtering, and added "Consecutive Unsuccessful" detection (configurable thresholds)
+ *   to flag numbers that are likely never going to deliver without different client treatment.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * PURPOSE
+ * Paste/import a VoApps “Number History” CSV into Excel, click that worksheet (ACTIVE),
+ * then run this script to generate trend + insight outputs.
+ *
+ * This analyzer ONLY uses rows that have a usable timestamp (required for cadence, hour/day insights).
+ *
+ * OUTPUT SHEETS (created fresh each run)
+ * 1) "Number Summary"
+ *    - Attempts, First/Last Attempt
+ *    - Cadence: "M/D/YYYY | +X | +Y | +Z" (gaps in days between consecutive attempts)
+ *    - Gap stats (min/avg/median/max days)
+ *    - Strict Success Rate (%)
+ *    - Attempts per week/month (density over the span)
+ *    - Top Message ID / Caller # / Combo + that combo’s delivered rate
+ *    - Best Hour / Worst Hour / Best Day-of-Week by success rate (guarded by minimum attempts per bucket)
+ *
+ * 2) "Consecutive Unsuccessful"
+ *    - Flags numbers with ≥ N consecutive "Unsuccessful delivery attempt" results spanning ≥ D days
+ *      (defaults: N=4 and D=30 days, configurable below).
+ *    - These are often “never going to deliver” numbers and should be treated differently by the client.
+ *
+ * 3) "Global Insights (Time)"
+ *    - Success rate by Hour of Day (0..23) for ALL records
+ *    - Success rate by Day of Week (Sun..Sat) for ALL records
+ *
+ * 4) "Global Insights (Msg & Caller)"
+ *    - Success rate by Message ID for ALL records
+ *    - Success rate by Caller Number for ALL records
+ *
+ * 5) "Analyzer Log"
+ *    - Run diagnostics and notes
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * IMPORTANT DEFINITIONS (STRICT)
+ * Delivered:
+ *   - Counted ONLY when voapps_result is EXACTLY: "Successfully delivered" (trimmed)
+ *
+ * Unsuccessful delivery attempt:
+ *   - Counted ONLY when voapps_result is EXACTLY: "Unsuccessful delivery attempt" (trimmed)
+ *
+ * Everything else is treated as NOT delivered and NOT “Unsuccessful delivery attempt” for the streak logic.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * GOTCHAS / QUIRKS
+ * 1) TIME ZONE:
+ *    Hour-of-day / day-of-week is based on how the timestamp parses in Office Scripts.
+ *    If your timestamps are UTC strings, you’ll see UTC-based buckets.
+ *    If you want forced UTC or forced local conversion, tell me and I’ll implement it cleanly.
+ *
+ * 2) CADENCE OUTPUT IS TEXT:
+ *    Cadence is written and forced to Text format so Excel doesn’t auto-reformat it.
+ *
+ * 3) ATTEMPTS PER WEEK / MONTH:
+ *    These are density metrics computed over the span between first and last attempt:
+ *      attempts / max(1, weeksBetween(first,last))
+ *      attempts / max(1, monthsBetween(first,last))
+ *    (Not a calendar “group by week/month” rollup.)
+ *
+ * 4) CONSECUTIVE UNSUCCESSFUL DETECTION:
+ *    We scan each number’s attempts in timestamp order and look for runs where:
+ *      - Each row in the run has result == "Unsuccessful delivery attempt"
+ *      - The run length is >= MIN_CONSEC_UNSUCCESS
+ *      - The span in days between run start and run end is >= MIN_RUN_SPAN_DAYS
+ *    We report the BEST qualifying run per number (highest run length; tie-breakers described in code).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * QUICK START
+ * 1) Paste/import your CSV into a worksheet.
+ * 2) Click that worksheet so it is ACTIVE.
+ * 3) Run the script.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+function main(workbook: ExcelScript.Workbook) {
+    // ── Per-number bucket guard for best/worst hour and best day-of-week
+    const MIN_BUCKET_ATTEMPTS = 3;
+
+    // ── Consecutive Unsuccessful detection (user-configurable)
+    // Default request: 4 consecutive unsuccessful spanning >= 30 days
+    const MIN_CONSEC_UNSUCCESS = 4;
+    const MIN_RUN_SPAN_DAYS = 30;
+
+    // ── Branding
+    const BRAND = {
+        fontName: "Montserrat",
+        fontSize: 11,
+        textColor: "#333333",
+        headerBg: "#3F2FB8",
+        headerText: "#FFFFFF",
+        tableStyle: "TableStyleMedium9"
+    };
+
+    const SHEET_NUM_SUM = "Number Summary";
+    const SHEET_UNSUCCESS = "Consecutive Unsuccessful";
+    const SHEET_TIME = "Global Insights (Time)";
+    const SHEET_MSGCALLER = "Global Insights (Msg & Caller)";
+    const SHEET_LOG = "Analyzer Log";
+
+    // ── Logging
+    const logs: string[] = [];
+    const log = (m: string) => logs.push(`[${new Date().toLocaleString()}] ${m}`);
+    log("===== VoApps — Number History Trend Analyzer v1.0.4 =====");
+    log(`Consecutive Unsuccessful rule: >= ${MIN_CONSEC_UNSUCCESS} consecutive "Unsuccessful delivery attempt" spanning >= ${MIN_RUN_SPAN_DAYS} days`);
+
+    // ── Active sheet input
+    const src = workbook.getActiveWorksheet();
+    if (!src) {
+        log("No active worksheet. Click your data tab, then run again.");
+        flushLogSheet(workbook, SHEET_LOG, logs);
+        return;
+    }
+    log(`Active sheet: "${src.getName()}"`);
+
+    const used = src.getUsedRange();
+    if (!used) {
+        log("Used range is empty. Paste/import your CSV, then run again.");
+        flushLogSheet(workbook, SHEET_LOG, logs);
+        return;
+    }
+
+    const rows = used.getRowCount();
+    const cols = used.getColumnCount();
+    log(`Used range size: ${rows} rows × ${cols} columns`);
+
+    if (rows < 2) {
+        log("Need at least 1 header row + 1 data row.");
+        flushLogSheet(workbook, SHEET_LOG, logs);
+        return;
+    }
+
+    // ── Read header row only
+    const headerVals = src.getRangeByIndexes(0, 0, 1, cols).getValues() as (string | number | boolean | Date | null)[][];
+    const headerRow = headerVals[0] as (string | number | boolean | Date | null)[];
+
+    const neededAliases: Record<Canon, string[]> = {
+        number: ["number", "phone_number", "phone number", "phone"],
+        timestamp: ["voapps_timestamp", "timestamp", "date", "datetime", "time"],
+        result: ["voapps_result", "result", "status"],
+        code: ["voapps_code", "code", "result_code", "status_code"],
+        message_id: ["message_id", "message id"],
+        caller_number: ["voapps_caller_number", "caller_number", "caller number"]
+    };
+
+    const headerIndex = indexHeaders(headerRow);
+    const map = mapAliasesToIndexes(neededAliases, headerIndex);
+
+    const missingEssentials: Canon[] = [];
+    if (map.number === undefined) missingEssentials.push("number");
+    if (map.timestamp === undefined) missingEssentials.push("timestamp");
+
+    if (missingEssentials.length > 0) {
+        log(`Missing required headers: ${missingEssentials.join(", ")}`);
+        log("Tip: check row 1 header names; underscores/hyphens/spaces are OK, case-insensitive.");
+        flushLogSheet(workbook, SHEET_LOG, logs);
+        return;
+    }
+    log("Header mapping: " + JSON.stringify(map));
+
+    // ── Read only needed columns
+    const nData = rows - 1;
+
+    const readCol = (c: number | undefined) =>
+    (c === undefined
+        ? makeEmptyCol(nData)
+        : (src.getRangeByIndexes(1, c, nData, 1).getValues() as (string | number | boolean | Date | null)[][]));
+
+    const numberCol = readCol(map.number);
+    const tsCol = readCol(map.timestamp);
+    const resultCol = readCol(map.result);
+    const codeCol = readCol(map.code);
+    const msgIdCol = readCol(map.message_id);
+    const callerCol = readCol(map.caller_number);
+
+    // ── Build records (timestamp required)
+    const recs: Rec[] = [];
+    for (let i = 0; i < nData; i++) {
+        const rawNum = safeToString(numberCol[i]?.[0]).trim();
+        const numNorm = normalizePhone(rawNum);
+        if (!numNorm) continue;
+
+        const dt = coerceDate(tsCol[i]?.[0] as unknown);
+        if (!dt) continue;
+
+        const res = safeToString(resultCol[i]?.[0]).trim();
+        const code = safeToString(codeCol[i]?.[0]).trim();
+        const msg = safeToString(msgIdCol[i]?.[0]).trim();
+
+        const callRaw = safeToString(callerCol[i]?.[0]).trim();
+        const callNorm = normalizePhone(callRaw);
+        const call = callNorm || callRaw;
+
+        recs.push({
+            number: numNorm,
+            timestamp: dt,
+            resultRaw: res,
+            codeRaw: code,
+            messageId: msg,
+            callerNumber: call
+        });
+    }
+
+    if (recs.length === 0) {
+        log("No timestamped rows were found after parsing. (Timestamp is required.)");
+        flushLogSheet(workbook, SHEET_LOG, logs);
+        return;
+    }
+    log(`Parsed rows (timestamp present): ${recs.length}`);
+
+    // ── Group by number
+    const byNumber: Map<string, Rec[]> = new Map();
+    for (let i = 0; i < recs.length; i++) {
+        const r = recs[i];
+        const existing = byNumber.get(r.number);
+        if (existing) existing.push(r);
+        else byNumber.set(r.number, [r]);
+    }
+
+    // Sort each number's rows by timestamp ascending
+    byNumber.forEach((arr: Rec[]) => {
+        arr.sort((a: Rec, b: Rec) => a.timestamp.getTime() - b.timestamp.getTime());
+    });
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // PER-NUMBER SUMMARY + CONSECUTIVE UNSUCCESSFUL DETECTION
+    // ───────────────────────────────────────────────────────────────────────────
+    const numberSummaryRows: (string | number | boolean)[][] = [];
+
+    // Track best qualifying unsuccessful run per number
+    const unsuccessfulBest: Map<string, UnsuccessRun> = new Map();
+
+    byNumber.forEach((arr: Rec[], num: string) => {
+        const attempts = arr.length;
+        const firstDt = arr[0].timestamp;
+        const lastDt = arr[arr.length - 1].timestamp;
+
+        // Cadence gaps (days between attempts)
+        const gaps: number[] = [];
+        for (let i = 1; i < arr.length; i++) {
+            const gapDays = Math.max(0, Math.round((arr[i].timestamp.getTime() - arr[i - 1].timestamp.getTime()) / 86400000));
+            gaps.push(gapDays);
+        }
+        const cadenceStr = buildCadenceString(firstDt, gaps); // M/D/YYYY | +1 | +2 ...
+
+        // Gap stats
+        const gapCount = gaps.length;
+        const gapMin = gapCount ? Math.min(...gaps) : 0;
+        const gapMax = gapCount ? Math.max(...gaps) : 0;
+        const gapAvg = gapCount ? round2(gaps.reduce((sum: number, v: number) => sum + v, 0) / gapCount) : 0;
+        const gapMed = gapCount ? round2(median(gaps)) : 0;
+
+        // Success (strict)
+        const deliveredCount = arr.filter((r: Rec) => isDeliveredExact(r.resultRaw)).length;
+        const successRatePct = attempts > 0 ? round2((deliveredCount / attempts) * 100) : 0;
+
+        // Attempts per week/month (density over span)
+        const weeksSpan = Math.max(1, diffWeeks(firstDt, lastDt));
+        const monthsSpan = Math.max(1, diffMonths(firstDt, lastDt));
+        const attemptsPerWeek = round2(attempts / weeksSpan);
+        const attemptsPerMonth = round2(attempts / monthsSpan);
+
+        // Top message / caller / combo + combo delivered rate
+        const msgCounts: Map<string, Counts> = new Map();
+        const callerCounts: Map<string, Counts> = new Map();
+        const comboCounts: Map<string, Counts> = new Map();
+
+        // Buckets for best/worst hour and best day-of-week (per number)
+        const hourBuckets: Map<number, Counts> = new Map();
+        const dowBuckets: Map<number, Counts> = new Map();
+
+        for (let i = 0; i < arr.length; i++) {
+            const r = arr[i];
+            const delivered01 = isDeliveredExact(r.resultRaw) ? 1 : 0;
+
+            const mid = r.messageId || "(blank)";
+            const cnum = r.callerNumber || "(blank)";
+            const comboKey = `${mid} ⟂ ${cnum}`;
+
+            bumpCounts(msgCounts, mid, delivered01);
+            bumpCounts(callerCounts, cnum, delivered01);
+            bumpCounts(comboCounts, comboKey, delivered01);
+
+            bumpCounts(hourBuckets, r.timestamp.getHours(), delivered01);
+            bumpCounts(dowBuckets, r.timestamp.getDay(), delivered01);
+        }
+
+        const topMsg = pickTopKey(msgCounts);
+        const topCaller = pickTopKey(callerCounts);
+        const topCombo = pickTopKey(comboCounts);
+
+        const topComboRatePct = topCombo
+            ? round2((comboCounts.get(topCombo)!.delivered / comboCounts.get(topCombo)!.tot) * 100)
+            : 0;
+
+        // Best/Worst hour and Best DOW (guarded)
+        const bestHour = pickBestBucketByRate(hourBuckets, MIN_BUCKET_ATTEMPTS, true);
+        const worstHour = pickBestBucketByRate(hourBuckets, MIN_BUCKET_ATTEMPTS, false);
+        const bestDow = pickBestBucketByRate(dowBuckets, MIN_BUCKET_ATTEMPTS, true);
+
+        const bestHourLabel = bestHour ? `${bestHour.key} (${bestHour.ratePct}% on ${bestHour.attempts})` : "(insufficient data)";
+        const worstHourLabel = worstHour ? `${worstHour.key} (${worstHour.ratePct}% on ${worstHour.attempts})` : "(insufficient data)";
+        const dowName = (d: number) => ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d] || String(d);
+        const bestDowLabel = bestDow ? `${dowName(bestDow.key)} (${bestDow.ratePct}% on ${bestDow.attempts})` : "(insufficient data)";
+
+        // ── Consecutive "Unsuccessful delivery attempt" detection (best qualifying run)
+        const bestRunForNum = findBestConsecutiveUnsuccessfulRun(arr, MIN_CONSEC_UNSUCCESS, MIN_RUN_SPAN_DAYS);
+        if (bestRunForNum) unsuccessfulBest.set(num, bestRunForNum);
+
+        numberSummaryRows.push([
+            num,
+            attempts,
+            excelSerialDateOnly(firstDt),
+            excelSerialDateOnly(lastDt),
+            cadenceStr,
+            gapCount,
+            gapMin,
+            gapAvg,
+            gapMed,
+            gapMax,
+            successRatePct,
+            attemptsPerWeek,
+            attemptsPerMonth,
+            topMsg || "",
+            topCaller || "",
+            topCombo || "",
+            topComboRatePct,
+            bestHourLabel,
+            worstHourLabel,
+            bestDowLabel
+        ]);
+    });
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // BUILD "Consecutive Unsuccessful" TABLE
+    // ───────────────────────────────────────────────────────────────────────────
+    const unsuccessfulRows: (string | number | boolean)[][] = [];
+
+    // Sort output to be most actionable: longest run first, then longest span, then most recent end
+    const unsuccessfulAll = Array.from(unsuccessfulBest.entries()).map(([num, run]) => ({ num, run }));
+    unsuccessfulAll.sort((a, b) => {
+        if (b.run.runLength !== a.run.runLength) return b.run.runLength - a.run.runLength;
+        if (b.run.spanDays !== a.run.spanDays) return b.run.spanDays - a.run.spanDays;
+        return b.run.end.getTime() - a.run.end.getTime();
+    });
+
+    for (let i = 0; i < unsuccessfulAll.length; i++) {
+        const item = unsuccessfulAll[i];
+        const num = item.num;
+        const run = item.run;
+
+        const allAttemptsForNum = byNumber.get(num)?.length ?? run.runLength;
+        const overallDelivered = (byNumber.get(num) || []).filter((r: Rec) => isDeliveredExact(r.resultRaw)).length;
+        const overallSuccessPct = allAttemptsForNum > 0 ? round2((overallDelivered / allAttemptsForNum) * 100) : 0;
+
+        unsuccessfulRows.push([
+            num,
+            run.runLength,
+            excelSerialDateOnly(run.start),
+            excelSerialDateOnly(run.end),
+            run.spanDays,
+            allAttemptsForNum,
+            overallSuccessPct,
+            run.lastMessageId || "(blank)",
+            run.lastCallerNumber || "(blank)"
+        ]);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // GLOBAL INSIGHTS
+    // ───────────────────────────────────────────────────────────────────────────
+    const hourMap: Map<number, Counts> = new Map();
+    const dowMap: Map<number, Counts> = new Map();
+    const msgMap: Map<string, Counts> = new Map();
+    const callerMap: Map<string, Counts> = new Map();
+
+    for (let i = 0; i < recs.length; i++) {
+        const r = recs[i];
+        const delivered01 = isDeliveredExact(r.resultRaw) ? 1 : 0;
+
+        bumpCounts(hourMap, r.timestamp.getHours(), delivered01);
+        bumpCounts(dowMap, r.timestamp.getDay(), delivered01);
+
+        bumpCounts(msgMap, r.messageId || "(blank)", delivered01);
+        bumpCounts(callerMap, r.callerNumber || "(blank)", delivered01);
+    }
+
+    const hourRows: (string | number | boolean)[][] = [];
+    const hourKeys = Array.from(hourMap.keys()).sort((a: number, b: number) => a - b);
+    for (let i = 0; i < hourKeys.length; i++) {
+        const h = hourKeys[i];
+        const v = hourMap.get(h)!;
+        hourRows.push([h, v.tot, v.delivered, v.tot ? round2((v.delivered / v.tot) * 100) : 0]);
+    }
+
+    const dowRows: (string | number | boolean)[][] = [];
+    const dowKeys = Array.from(dowMap.keys()).sort((a: number, b: number) => a - b);
+    for (let i = 0; i < dowKeys.length; i++) {
+        const d = dowKeys[i];
+        const v = dowMap.get(d)!;
+        const name = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d] || String(d);
+        dowRows.push([`${d} (${name})`, v.tot, v.delivered, v.tot ? round2((v.delivered / v.tot) * 100) : 0]);
+    }
+
+    const msgRows: (string | number | boolean)[][] = [];
+    const msgEntries = Array.from(msgMap.entries()).sort((a: [string, Counts], b: [string, Counts]) => b[1].tot - a[1].tot);
+    for (let i = 0; i < msgEntries.length; i++) {
+        const k = msgEntries[i][0];
+        const v = msgEntries[i][1];
+        msgRows.push([k, v.tot, v.delivered, v.tot ? round2((v.delivered / v.tot) * 100) : 0]);
+    }
+
+    const callerRows: (string | number | boolean)[][] = [];
+    const callerEntries = Array.from(callerMap.entries()).sort((a: [string, Counts], b: [string, Counts]) => b[1].tot - a[1].tot);
+    for (let i = 0; i < callerEntries.length; i++) {
+        const k = callerEntries[i][0];
+        const v = callerEntries[i][1];
+        callerRows.push([k, v.tot, v.delivered, v.tot ? round2((v.delivered / v.tot) * 100) : 0]);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────
+    // WRITE OUTPUTS
+    // ───────────────────────────────────────────────────────────────────────────
+
+    // 1) Number Summary
+    const numHeaders = [
+        "Number",
+        "Attempts",
+        "First Attempt",
+        "Last Attempt",
+        "Cadence (First | +days ...)",
+        "Gap Count",
+        "Gap Min (days)",
+        "Gap Avg (days)",
+        "Gap Median (days)",
+        "Gap Max (days)",
+        "Success Rate (%)",
+        "Attempts / Week",
+        "Attempts / Month",
+        "Top Message ID",
+        "Top Caller Number",
+        "Top (Message ⟂ Caller) Combo",
+        "Top Combo Delivered Rate (%)",
+        "Best Hour (rate% on N, min 3)",
+        "Worst Hour (rate% on N, min 3)",
+        "Best Day-of-Week (rate% on N, min 3)"
+    ];
+    writeTableAsStyledTable(workbook, SHEET_NUM_SUM, numHeaders, numberSummaryRows, BRAND);
+
+    // Format columns (Number Summary)
+    formatDateColumns(workbook, SHEET_NUM_SUM, [3, 4]);
+    formatIntColumns(workbook, SHEET_NUM_SUM, [2, 6, 7, 10]);
+    formatDecimalColumns(workbook, SHEET_NUM_SUM, [8, 9, 12, 13]);
+    formatPercentColumns(workbook, SHEET_NUM_SUM, [11, 17]);
+    formatTextColumns(workbook, SHEET_NUM_SUM, [5]);
+
+    // 2) Consecutive Unsuccessful
+    const unsuccessHeaders = [
+        "Number",
+        `Consecutive "Unsuccessful delivery attempt" (>=${MIN_CONSEC_UNSUCCESS})`,
+        "Run Start",
+        "Run End",
+        `Run Span (days) (>=${MIN_RUN_SPAN_DAYS})`,
+        "Total Attempts (All)",
+        "Overall Success Rate (%)",
+        "Last Message ID in Run",
+        "Last Caller # in Run"
+    ];
+    writeTableAsStyledTable(workbook, SHEET_UNSUCCESS, unsuccessHeaders, unsuccessfulRows, BRAND);
+
+    // Format columns (Consecutive Unsuccessful)
+    formatDateColumns(workbook, SHEET_UNSUCCESS, [3, 4]);
+    formatIntColumns(workbook, SHEET_UNSUCCESS, [2, 5, 6]);
+    formatPercentColumns(workbook, SHEET_UNSUCCESS, [7]);
+
+    // 3) Global Insights (Time)
+    const timeSheet = recreateSheet(workbook, SHEET_TIME);
+
+    const hourHeader = ["Hour (0-23)", "Attempts", "Delivered", "Success Rate (%)"];
+    const hourAll = [hourHeader, ...hourRows];
+    timeSheet.getRangeByIndexes(0, 0, hourAll.length, hourHeader.length).setValues(hourAll as (string | number | boolean)[][]);
+    const hourTbl = timeSheet.addTable(`A1:${colToA1(hourHeader.length)}${hourAll.length}`, true);
+    hourTbl.setPredefinedTableStyle(BRAND.tableStyle);
+    hourTbl.setShowBandedRows(true);
+
+    const spacerRowIdx = hourAll.length + 1;
+    timeSheet.getRangeByIndexes(spacerRowIdx - 1, 0, 1, hourHeader.length).setValues([makeBlankRow(hourHeader.length)]);
+
+    const dowHeader = ["DayOfWeek", "Attempts", "Delivered", "Success Rate (%)"];
+    const dowAll = [dowHeader, ...dowRows];
+    timeSheet.getRangeByIndexes(spacerRowIdx, 0, dowAll.length, dowHeader.length).setValues(dowAll as (string | number | boolean)[][]);
+    const dowStart = `A${spacerRowIdx + 1}`;
+    const dowEnd = `${colToA1(dowHeader.length)}${spacerRowIdx + dowAll.length}`;
+    const dowTbl = timeSheet.addTable(`${dowStart}:${dowEnd}`, true);
+    dowTbl.setPredefinedTableStyle(BRAND.tableStyle);
+    dowTbl.setShowBandedRows(true);
+
+    brandTableRange(hourTbl, BRAND);
+    brandTableRange(dowTbl, BRAND);
+    autofitFreeze(timeSheet);
+
+    formatPercentColumnsOnSheet(timeSheet, 4);
+
+    // 4) Global Insights (Msg & Caller)
+    const mcSheet = recreateSheet(workbook, SHEET_MSGCALLER);
+
+    const msgHeader = ["Message ID", "Attempts", "Delivered", "Success Rate (%)"];
+    const msgAll = [msgHeader, ...msgRows];
+    mcSheet.getRangeByIndexes(0, 0, msgAll.length, msgHeader.length).setValues(msgAll as (string | number | boolean)[][]);
+    const msgTbl = mcSheet.addTable(`A1:${colToA1(msgHeader.length)}${msgAll.length}`, true);
+    msgTbl.setPredefinedTableStyle(BRAND.tableStyle);
+    msgTbl.setShowBandedRows(true);
+
+    const sepIdx = msgAll.length + 1;
+    mcSheet.getRangeByIndexes(sepIdx - 1, 0, 1, msgHeader.length).setValues([makeBlankRow(msgHeader.length)]);
+
+    const callerHeader = ["Caller Number", "Attempts", "Delivered", "Success Rate (%)"];
+    const callerAll = [callerHeader, ...callerRows];
+    mcSheet.getRangeByIndexes(sepIdx, 0, callerAll.length, callerHeader.length).setValues(callerAll as (string | number | boolean)[][]);
+    const callerStart = `A${sepIdx + 1}`;
+    const callerEnd = `${colToA1(callerHeader.length)}${sepIdx + callerAll.length}`;
+    const callerTbl = mcSheet.addTable(`${callerStart}:${callerEnd}`, true);
+    callerTbl.setPredefinedTableStyle(BRAND.tableStyle);
+    callerTbl.setShowBandedRows(true);
+
+    brandTableRange(msgTbl, BRAND);
+    brandTableRange(callerTbl, BRAND);
+    autofitFreeze(mcSheet);
+
+    formatPercentColumnsOnSheet(mcSheet, 4);
+
+    // 5) Log
+    flushLogSheet(workbook, SHEET_LOG, logs);
+
+    // Return to source
+    src.activate();
+}
+
+/*────────────────────────────── Types ───────────────────────────────*/
+
+type Canon = "number" | "timestamp" | "result" | "code" | "message_id" | "caller_number";
+
+type Rec = {
+    number: string;
+    timestamp: Date;
+    resultRaw: string;
+    codeRaw: string;
+    messageId: string;
+    callerNumber: string;
+};
+
+type Counts = {
+    tot: number;
+    delivered: number;
+};
+
+type BucketPick = {
+    key: number;
+    attempts: number;
+    ratePct: number;
+};
+
+type UnsuccessRun = {
+    runLength: number;
+    start: Date;
+    end: Date;
+    spanDays: number;
+    lastMessageId: string;
+    lastCallerNumber: string;
+};
+
+/*──────────────────────────── Header helpers ───────────────────────*/
+
+function indexHeaders(headerRow: (string | number | boolean | Date | null)[]): Record<string, number> {
+    const out: Record<string, number> = {};
+    const normed = headerRow.map((h: string | number | boolean | Date | null) => normHeader(safeToString(h)));
+    for (let i = 0; i < normed.length; i++) {
+        const k = normed[i];
+        if (k) out[k] = i;
+    }
+    return out;
+}
+
+function mapAliasesToIndexes(
+    aliases: Record<Canon, string[]>,
+    indexMap: Record<string, number>
+): Partial<Record<Canon, number>> {
+    const out: Partial<Record<Canon, number>> = {};
+    (Object.keys(aliases) as Canon[]).forEach((canon: Canon) => {
+        const list = aliases[canon];
+        for (let i = 0; i < list.length; i++) {
+            const candidate = list[i];
+            const key = normHeader(candidate);
+            if (indexMap[key] !== undefined) {
+                out[canon] = indexMap[key];
+                break;
+            }
+        }
+    });
+    return out;
+}
+
+function normHeader(s: string): string {
+    return (s ?? "")
+        .toString()
+        .replace(/\uFEFF/g, "")
+        .replace(/[\u200B-\u200D]/g, "")
+        .replace(/\u00A0/g, " ")
+        .toLowerCase()
+        .replace(/[_\-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+/*──────────────────────────── Parse helpers ────────────────────────*/
+
+function safeToString(v: unknown): string {
+    return v === null || v === undefined ? "" : String(v);
+}
+
+function normalizePhone(s: string): string {
+    const digits = (s || "").replace(/\D+/g, "");
+    if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+    if (digits.length === 10) return digits;
+    return digits.length >= 7 ? digits : "";
+}
+
+function coerceDate(v: unknown): Date | null {
+    if (v instanceof Date && !isNaN(v.getTime())) return v;
+
+    if (typeof v === "number" && isFinite(v)) {
+        // Excel serial -> JS Date, preserve fractional time
+        const epoch = Date.UTC(1899, 11, 30);
+        const ms = epoch + (v * 86400000);
+        const d = new Date(ms);
+        return isNaN(d.getTime()) ? null : d;
+    }
+
+    if (typeof v === "string" && v.trim()) {
+        const d = new Date(v);
+        if (!isNaN(d.getTime())) return d;
+    }
+
+    return null;
+}
+
+function excelSerialDateOnly(d: Date): number {
+    const epoch = Date.UTC(1899, 11, 30);
+    const utc = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+    return Math.round((utc - epoch) / 86400000);
+}
+
+/*──────────────────────────── Delivered logic ───────────────────────*/
+
+function isDeliveredExact(resultRaw: string): boolean {
+    return (resultRaw || "").trim() === "Successfully delivered";
+}
+
+function isUnsuccessfulExact(resultRaw: string): boolean {
+    return (resultRaw || "").trim() === "Unsuccessful delivery attempt";
+}
+
+/*──────────────────────────── Cadence helpers ───────────────────────*/
+
+function buildCadenceString(first: Date, gaps: number[]): string {
+    // Example: 12/29/2025 | +1 | +1 | +2 | +3 | +1
+    const base = mdy(first);
+    if (!gaps || gaps.length === 0) return base;
+    return `${base} | ${gaps.map((g: number) => `+${g}`).join(" | ")}`;
+}
+
+function mdy(d: Date): string {
+    const m = d.getMonth() + 1;
+    const day = d.getDate();
+    const y = d.getFullYear();
+    return `${m}/${day}/${y}`;
+}
+
+function median(arr: number[]): number {
+    const a = [...arr].sort((x: number, y: number) => x - y);
+    const n = a.length;
+    if (n === 0) return 0;
+    const mid = Math.floor(n / 2);
+    return n % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function round2(n: number): number {
+    return Math.round(n * 100) / 100;
+}
+
+/*──────────────────────────── Span helpers ──────────────────────────*/
+
+function diffWeeks(a: Date, b: Date): number {
+    const ms = Math.abs(b.getTime() - a.getTime());
+    const weeks = ms / (7 * 86400000);
+    return Math.ceil(weeks);
+}
+
+function diffMonths(a: Date, b: Date): number {
+    // Inclusive-ish month span using calendar month boundaries
+    const start = new Date(a.getFullYear(), a.getMonth(), 1);
+    const end = new Date(b.getFullYear(), b.getMonth(), 1);
+    const months = (end.getFullYear() - start.getFullYear()) * 12 + (end.getMonth() - start.getMonth());
+    return Math.max(1, months + 1);
+}
+
+function spanDaysFloor(a: Date, b: Date): number {
+    // Conservative whole-day span between two timestamps
+    const ms = b.getTime() - a.getTime();
+    return Math.max(0, Math.floor(ms / 86400000));
+}
+
+/*──────────────────────────── Counting helpers ──────────────────────*/
+
+function bumpCounts<K extends (number | string)>(m: Map<K, Counts>, key: K, delivered01: number): void {
+    const cur = m.get(key);
+    if (cur) {
+        cur.tot += 1;
+        cur.delivered += delivered01;
+    } else {
+        m.set(key, { tot: 1, delivered: delivered01 });
+    }
+}
+
+function pickTopKey(m: Map<string, Counts>): string | null {
+    let bestKey: string | null = null;
+    let bestTot = -1;
+    let bestDelivered = -1;
+
+    const entries = Array.from(m.entries());
+    for (let i = 0; i < entries.length; i++) {
+        const k = entries[i][0];
+        const v = entries[i][1];
+
+        // Primary: highest count; Tie-breaker: higher delivered; then alpha
+        if (v.tot > bestTot) {
+            bestKey = k; bestTot = v.tot; bestDelivered = v.delivered;
+        } else if (v.tot === bestTot) {
+            if (v.delivered > bestDelivered) {
+                bestKey = k; bestDelivered = v.delivered;
+            } else if (v.delivered === bestDelivered && bestKey !== null) {
+                if (String(k).toLowerCase() < String(bestKey).toLowerCase()) bestKey = k;
+            }
+        }
+    }
+    return bestKey;
+}
+
+function pickBestBucketByRate(
+    buckets: Map<number, Counts>,
+    minAttempts: number,
+    best: boolean
+): BucketPick | null {
+    const keys = Array.from(buckets.keys()).sort((a: number, b: number) => a - b);
+
+    let chosen: BucketPick | null = null;
+    for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        const v = buckets.get(k)!;
+        if (v.tot < minAttempts) continue;
+
+        const ratePct = round2((v.delivered / v.tot) * 100);
+
+        if (!chosen) {
+            chosen = { key: k, attempts: v.tot, ratePct };
+            continue;
+        }
+
+        if (best) {
+            if (ratePct > chosen.ratePct) chosen = { key: k, attempts: v.tot, ratePct };
+            else if (ratePct === chosen.ratePct && v.tot > chosen.attempts) chosen = { key: k, attempts: v.tot, ratePct };
+        } else {
+            if (ratePct < chosen.ratePct) chosen = { key: k, attempts: v.tot, ratePct };
+            else if (ratePct === chosen.ratePct && v.tot > chosen.attempts) chosen = { key: k, attempts: v.tot, ratePct };
+        }
+    }
+
+    return chosen;
+}
+
+/*──────────────────────────── Unsuccessful run logic ────────────────*/
+
+function findBestConsecutiveUnsuccessfulRun(
+    arr: Rec[],
+    minConsec: number,
+    minSpanDays: number
+): UnsuccessRun | null {
+    // We assume arr is already sorted ascending by timestamp.
+    let runStartIdx = -1;
+    let runLen = 0;
+
+    let best: UnsuccessRun | null = null;
+
+    const considerRun = (startIdx: number, endIdx: number) => {
+        const start = arr[startIdx].timestamp;
+        const end = arr[endIdx].timestamp;
+        const spanDays = spanDaysFloor(start, end);
+
+        const length = endIdx - startIdx + 1;
+        if (length < minConsec) return;
+        if (spanDays < minSpanDays) return;
+
+        const candidate: UnsuccessRun = {
+            runLength: length,
+            start,
+            end,
+            spanDays,
+            lastMessageId: arr[endIdx].messageId || "",
+            lastCallerNumber: arr[endIdx].callerNumber || ""
+        };
+
+        // Choose the "best" run per number:
+        // 1) longer run length
+        // 2) longer span days
+        // 3) more recent end timestamp
+        if (!best) {
+            best = candidate;
+            return;
+        }
+        if (candidate.runLength > best.runLength) { best = candidate; return; }
+        if (candidate.runLength === best.runLength && candidate.spanDays > best.spanDays) { best = candidate; return; }
+        if (candidate.runLength === best.runLength && candidate.spanDays === best.spanDays && candidate.end.getTime() > best.end.getTime()) {
+            best = candidate; return;
+        }
+    };
+
+    for (let i = 0; i < arr.length; i++) {
+        const isUnsucc = isUnsuccessfulExact(arr[i].resultRaw);
+
+        if (isUnsucc) {
+            if (runLen === 0) runStartIdx = i;
+            runLen += 1;
+        } else {
+            if (runLen > 0 && runStartIdx >= 0) {
+                considerRun(runStartIdx, i - 1);
+            }
+            runStartIdx = -1;
+            runLen = 0;
+        }
+    }
+
+    // Close a run at end
+    if (runLen > 0 && runStartIdx >= 0) {
+        considerRun(runStartIdx, arr.length - 1);
+    }
+
+    return best;
+}
+
+/*──────────────────────────── Output helpers ───────────────────────*/
+
+function recreateSheet(workbook: ExcelScript.Workbook, name: string): ExcelScript.Worksheet {
+    const existing = workbook.getWorksheet(name);
+    if (existing) existing.delete();
+    return workbook.addWorksheet(name);
+}
+
+function writeTableAsStyledTable(
+    workbook: ExcelScript.Workbook,
+    sheetName: string,
+    headers: string[],
+    rows: (string | number | boolean)[][],
+    brand: { fontName: string; fontSize: number; textColor: string; headerBg: string; headerText: string; tableStyle: string }
+): void {
+    const ws = recreateSheet(workbook, sheetName);
+
+    const all: (string | number | boolean)[][] = [headers, ...(rows ?? [])];
+    const rCount = all.length;
+    const cCount = headers.length;
+
+    ws.getRangeByIndexes(0, 0, rCount, cCount).setValues(all);
+
+    const lastCell = `${colToA1(cCount)}${rCount}`;
+    const tbl = ws.addTable(`A1:${lastCell}`, true);
+    tbl.setPredefinedTableStyle(brand.tableStyle);
+    tbl.setShowBandedRows(true);
+
+    brandTableRange(tbl, brand);
+    autofitFreeze(ws);
+}
+
+function brandTableRange(
+    tbl: ExcelScript.Table,
+    brand: { fontName: string; fontSize: number; textColor: string; headerBg: string; headerText: string }
+): void {
+    const allRange = tbl.getRange();
+    const hdr = tbl.getHeaderRowRange();
+
+    const fmt = allRange.getFormat();
+    fmt.getFont().setName(brand.fontName);
+    fmt.getFont().setSize(brand.fontSize);
+    fmt.getFont().setColor(brand.textColor);
+
+    const hfmt = hdr.getFormat();
+    hfmt.getFont().setBold(true);
+    hfmt.getFont().setName(brand.fontName);
+    hfmt.getFont().setColor(brand.headerText);
+    hfmt.getFill().setColor(brand.headerBg);
+}
+
+function autofitFreeze(ws: ExcelScript.Worksheet): void {
+    const used = ws.getUsedRange();
+    if (used) used.getFormat().autofitColumns();
+    ws.getFreezePanes().freezeRows(1);
+}
+
+function colToA1(n: number): string {
+    let s = "";
+    let x = n;
+    while (x > 0) {
+        const m = (x - 1) % 26;
+        s = String.fromCharCode(65 + m) + s;
+        x = Math.floor((x - 1) / 26);
+    }
+    return s;
+}
+
+function makeBlankRow(colCount: number): (string | number | boolean)[] {
+    const row: (string | number | boolean)[] = [];
+    for (let i = 0; i < colCount; i++) row.push("");
+    return row;
+}
+
+function makeEmptyCol(n: number): (string | number | boolean | Date | null)[][] {
+    const out: (string | number | boolean | Date | null)[][] = [];
+    for (let i = 0; i < n; i++) out.push([null]);
+    return out;
+}
+
+function flushLogSheet(workbook: ExcelScript.Workbook, name: string, lines: string[]): void {
+    const existing = workbook.getWorksheet(name);
+    if (existing) existing.delete();
+
+    const s = workbook.addWorksheet(name);
+    const out: (string | number | boolean)[][] = [["Log"], ...lines.map((l: string) => [l])];
+
+    s.getRangeByIndexes(0, 0, out.length, 1).setValues(out);
+    s.getRange("A1").getFormat().getFont().setBold(true);
+    s.getFreezePanes().freezeRows(1);
+
+    const used = s.getUsedRange();
+    if (used) used.getFormat().autofitColumns();
+}
+
+/*──────────────────────────── Formatting helpers ────────────────────*/
+
+function formatDateColumns(workbook: ExcelScript.Workbook, sheetName: string, oneBasedCols: number[]): void {
+    const ws = workbook.getWorksheet(sheetName);
+    if (!ws) return;
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    for (let i = 0; i < oneBasedCols.length; i++) {
+        const c = oneBasedCols[i];
+        ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1).setNumberFormatLocal("m/d/yyyy");
+    }
+}
+
+function formatIntColumns(workbook: ExcelScript.Workbook, sheetName: string, oneBasedCols: number[]): void {
+    const ws = workbook.getWorksheet(sheetName);
+    if (!ws) return;
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    for (let i = 0; i < oneBasedCols.length; i++) {
+        const c = oneBasedCols[i];
+        ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1).setNumberFormatLocal("0");
+    }
+}
+
+function formatDecimalColumns(workbook: ExcelScript.Workbook, sheetName: string, oneBasedCols: number[]): void {
+    const ws = workbook.getWorksheet(sheetName);
+    if (!ws) return;
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    for (let i = 0; i < oneBasedCols.length; i++) {
+        const c = oneBasedCols[i];
+        ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1).setNumberFormatLocal("0.00");
+    }
+}
+
+function formatTextColumns(workbook: ExcelScript.Workbook, sheetName: string, oneBasedCols: number[]): void {
+    const ws = workbook.getWorksheet(sheetName);
+    if (!ws) return;
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    for (let i = 0; i < oneBasedCols.length; i++) {
+        const c = oneBasedCols[i];
+        ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1).setNumberFormatLocal("@");
+    }
+}
+
+/**
+ * Converts 0..100 values to 0..1 then applies percent formatting.
+ */
+function formatPercentColumns(workbook: ExcelScript.Workbook, sheetName: string, oneBasedCols: number[]): void {
+    const ws = workbook.getWorksheet(sheetName);
+    if (!ws) return;
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    for (let i = 0; i < oneBasedCols.length; i++) {
+        const c = oneBasedCols[i];
+        const rng = ws.getRangeByIndexes(1, c - 1, totalRows - 1, 1);
+        const vals = rng.getValues() as (string | number | boolean)[][];
+
+        const scaled: (string | number | boolean)[][] = vals.map((row: (string | number | boolean)[]) => {
+            const v = typeof row[0] === "number" ? (row[0] as number) / 100 : row[0];
+            return [v];
+        });
+
+        rng.setValues(scaled);
+        rng.setNumberFormatLocal("0.0%");
+    }
+}
+
+/**
+ * For sheets where success rate is column 4 and already stored as 0..100 in the sheet values.
+ */
+function formatPercentColumnsOnSheet(ws: ExcelScript.Worksheet, oneBasedCol: number): void {
+    const used = ws.getUsedRange();
+    if (!used) return;
+
+    const totalRows = used.getRowCount();
+    if (totalRows <= 1) return;
+
+    const rng = ws.getRangeByIndexes(1, oneBasedCol - 1, totalRows - 1, 1);
+    const vals = rng.getValues() as (string | number | boolean)[][];
+
+    const scaled: (string | number | boolean)[][] = vals.map((row: (string | number | boolean)[]) => {
+        const v = typeof row[0] === "number" ? (row[0] as number) / 100 : row[0];
+        return [v];
+    });
+
+    rng.setValues(scaled);
+    rng.setNumberFormatLocal("0.0%");
+}
