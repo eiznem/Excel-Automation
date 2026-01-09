@@ -1,46 +1,51 @@
 /**
  * ─────────────────────────────────────────────────────────────────────────────
- * VoApps — Number Sentry Blocked Streak Analyzer
- * Version: 1.10.0  (skip non-”Success” rows)
- * Last Updated: 2025-09-08
+ * VoApps — Number Sentry Blocked & Labeled Streak Analyzer
+ * Version: 1.12.0  (adds “is_labeled” parallel analysis + summary columns)
+ * Last Updated: 2026-01-06
  *
  * WHAT IT DOES
- *  • Reads ONLY row 1 (headers) and ONLY the required columns from the ACTIVE sheet:
- *      Number | Carrier | Date | is_blocked | Entity | OBN Status | Preferred Business Name | Test Status
- *  • **NEW:** Filters out any row whose Test Status is not "Success" (case-insensitive).
- *  • Groups by (Number, Carrier) and counts consecutive **blocked test DAYS** (calendar dates).
- *  • Outputs two brand-styled **Excel Tables**:
- *      1) "Blocked Streaks"   — per (Number, Carrier) currently blocked, with streak details.
- *      2) "Summary by Number" — per Number: carriers blocking, count, longest current streak.
+ *  • Reads ONLY row 1 (headers) and only the required columns from the ACTIVE sheet:
+ *    Number | Carrier | Date | is_blocked | is_labeled | Entity | OBN Status |
+ *    Preferred Business Name | Test Status
+ *  • Filters out any row whose Test Status is not "Success" (case-insensitive).
+ *  • Groups by (Number, Carrier) and counts consecutive **blocked** test DAYS and
+ *    consecutive **labeled** test DAYS (calendar dates).
+ *  • Outputs three brand-styled **Excel Tables**:
+ *      1) "Blocked Streaks"   — per (Number, Carrier) currently blocked.
+ *      2) "Labeled Streaks"   — per (Number, Carrier) currently labeled.
+ *      3) "Summary by Number" — per Number: carriers blocking/labeled, counts,
+ *                               longest current streaks for each.
  *  • "Analyzer Log" sheet records run details & tips.
  *
  * HOW TO USE
- * Download Number History report from Test Summary (Test History section): https://portal.numbersentry.com/test-summary/
  *  1) Click the sheet that contains your data (make it ACTIVE).
- *  2) Row 1 must include the headers above (any order; case-insensitive; underscores/hyphens/spaces OK).
- *  3) Run the script. It creates/refreshes the 3 sheets and returns to your active sheet.
+ *  2) Row 1 must include the headers above (any order; case-insensitive; underscores/
+ *     hyphens/spaces OK).
+ *  3) Run the script. It creates/refreshes the 4 sheets and returns to your active sheet.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
 function main(workbook: ExcelScript.Workbook) {
-    // ── Branding (strings only to avoid API aliasing/type issues)
+    // ── Branding (stored as plain values to avoid API aliasing/type issues)
     const BRAND = {
         fontName: "Montserrat",
         fontSize: 11,
         textColor: "#333333",
-        headerBg: "#16509B",         // Replace with your exact VoApps hex if needed
+        headerBg: "#16509B",          // VoApps dark blue
         headerText: "#FFFFFF",
-        tableStyle: "TableStyleMedium9" // Any built-in Excel style name
+        tableStyle: "TableStyleMedium9" // built-in Excel style name
     };
 
     const LOG_SHEET = "Analyzer Log";
-    const OUT_DETAIL_SHEET = "Blocked Streaks";
+    const OUT_BLOCKED_SHEET = "Blocked Streaks";
+    const OUT_LABELED_SHEET = "Labeled Streaks";
     const OUT_SUMMARY_SHEET = "Summary by Number";
 
     // ── Buffered logging (single write for performance)
     const logs: string[] = [];
     const log = (m: string) => logs.push(`[${new Date().toLocaleString()}] ${m}`);
-    log("===== VoApps — Number Sentry Blocked Streak Analyzer v1.10.0 =====");
+    log("===== VoApps — Number Sentry Blocked & Labeled Streak Analyzer v1.12.0 =====");
 
     // ── Use ACTIVE worksheet as input
     const ws = workbook.getActiveWorksheet();
@@ -72,12 +77,13 @@ function main(workbook: ExcelScript.Workbook) {
     const headerVals = ws.getRangeByIndexes(0, 0, 1, totalCols).getValues() as (string | number | boolean | Date | null)[][];
     const headerRow = (headerVals && headerVals.length ? headerVals[0] : []) as (string | number | boolean | Date | null)[];
 
-    // Required headers (now explicitly includes Test Status)
+    // Required headers
     const required: CanonHeader[] = [
         "Number",
         "Carrier",
         "Date",
         "is_blocked",
+        "is_labeled",
         "Entity",
         "OBN Status",
         "Preferred Business Name",
@@ -87,7 +93,7 @@ function main(workbook: ExcelScript.Workbook) {
     const missing = required.filter((h) => headerMap[h] === undefined);
     if (missing.length) {
         log(`Could not find required headers in row 1: ${missing.join(", ")}`);
-        log("Tip: exact words not required; case/underscores/hyphens/spaces are normalized.");
+        log("Tip: exact words not required; case/underscores/hyphens are normalized.");
         flushLogSheet(workbook, LOG_SHEET, logs);
         return;
     }
@@ -102,6 +108,7 @@ function main(workbook: ExcelScript.Workbook) {
     const carCol = readCol(headerMap["Carrier"]);
     const dateCol = readCol(headerMap["Date"]);
     const blkCol = readCol(headerMap["is_blocked"]);
+    const lblCol = readCol(headerMap["is_labeled"]);
     const entCol = readCol(headerMap["Entity"]);
     const obnCol = readCol(headerMap["OBN Status"]);
     const pbnCol = readCol(headerMap["Preferred Business Name"]);
@@ -110,12 +117,13 @@ function main(workbook: ExcelScript.Workbook) {
     // ── Build filtered records (skip where Test Status ≠ "Success")
     const records: Rec[] = [];
     for (let i = 0; i < dataRowCount; i++) {
-        if (!isSuccess(tstCol[i]?.[0])) continue; // <-- NEW filter
+        if (!isSuccess(tstCol[i]?.[0])) continue; // success-only filter
 
         const numberStr = safeToString(numCol[i]?.[0]).trim();
         const carrierStr = safeToString(carCol[i]?.[0]).trim();
         const dateOnly = coerceDateOnly(dateCol[i]?.[0] as unknown);
-        const isBlocked = normalizeBlocked(blkCol[i]?.[0] as unknown);
+        const isBlocked = normalize01(blkCol[i]?.[0] as unknown);
+        const isLabeled = normalize01(lblCol[i]?.[0] as unknown);
         const entity = safeToString(entCol[i]?.[0]).trim();
         const obnStatus = safeToString(obnCol[i]?.[0]).trim();
         const pbn = safeToString(pbnCol[i]?.[0]).trim();
@@ -127,6 +135,7 @@ function main(workbook: ExcelScript.Workbook) {
             carrier: carrierStr,
             date: dateOnly,
             isBlocked,
+            isLabeled,
             entity,
             obnStatus,
             preferredBusinessName: pbn
@@ -144,19 +153,22 @@ function main(workbook: ExcelScript.Workbook) {
     const groups = groupByNumberCarrier(records);
     log(`(Number, Carrier) groups: ${groups.length}`);
 
-    // ── Compute current blocked streaks
-    const details: DetailRow[] = [];
+    // ── Compute current blocked & labeled streaks
+    const blockedDetails: DetailRow[] = [];
+    const labeledDetails: DetailRow[] = [];
     const summaryMap: Map<string, SummaryRow> = new Map();
 
     for (const g of groups) {
+        // Aggregate per calendar date for both blocked and labeled dimensions
         const byDate: Map<string, DayStatus> = new Map();
         let lastSeenKey = "";
         const latestRec = g.rows[0];
 
         for (const rec of g.rows) {
             const key = ymd(rec.date);
-            const cur = byDate.get(key) ?? { date: rec.date, anyBlocked: false, anyRowCount: 0 };
+            const cur = byDate.get(key) ?? { date: rec.date, anyBlocked: false, anyLabeled: false, anyRowCount: 0 };
             cur.anyBlocked = cur.anyBlocked || rec.isBlocked === 1;
+            cur.anyLabeled = cur.anyLabeled || rec.isLabeled === 1;
             cur.anyRowCount += 1;
             byDate.set(key, cur);
             if (!lastSeenKey || key > lastSeenKey) lastSeenKey = key;
@@ -166,7 +178,7 @@ function main(workbook: ExcelScript.Workbook) {
 
         const daysDesc = Array.from(byDate.keys()).sort((a, b) => b.localeCompare(a));
         const latestKey = daysDesc[0];
-        const currentlyBlocked = byDate.get(latestKey)!.anyBlocked;
+        const dsLatest = byDate.get(latestKey)!;
 
         // Ensure per-number summary exists and keep the most recent meta
         if (!summaryMap.has(g.number)) {
@@ -177,7 +189,10 @@ function main(workbook: ExcelScript.Workbook) {
                 preferredBusinessName: latestRec.preferredBusinessName,
                 currentlyBlockedCarriers: [],
                 currentlyBlockingCount: 0,
-                longestCurrentStreakDays: 0,
+                longestCurrentBlockedStreakDays: 0,
+                currentlyLabeledCarriers: [],
+                currentlyLabeledCount: 0,
+                longestCurrentLabeledStreakDays: 0,
                 _metaLastSeenMs: latestRec.date.getTime()
             });
         } else {
@@ -190,40 +205,75 @@ function main(workbook: ExcelScript.Workbook) {
             }
         }
 
-        if (!currentlyBlocked) continue;
+        // ── BLOCKED: only if latest day is blocked
+        if (dsLatest.anyBlocked) {
+            let streak = 0;
+            let evidence = 0;
+            for (const k of daysDesc) {
+                const ds = byDate.get(k)!;
+                if (!ds.anyBlocked) break;
+                streak++;
+                evidence += ds.anyRowCount;
+            }
+            const streakEndDate = parseYmd(latestKey);
+            const streakStartKey = daysDesc.slice(0, streak).reverse()[0];
+            const streakStartDate = streakStartKey ? parseYmd(streakStartKey) : streakEndDate;
 
-        // Count consecutive BLOCKED TEST DAYS from newest back
-        let streak = 0;
-        let evidence = 0;
-        for (const k of daysDesc) {
-            const ds = byDate.get(k)!;
-            if (!ds.anyBlocked) break;
-            streak++;
-            evidence += ds.anyRowCount;
+            blockedDetails.push({
+                number: g.number,
+                entity: latestRec.entity,
+                preferredBusinessName: latestRec.preferredBusinessName,
+                obnStatus: latestRec.obnStatus,
+                carrier: g.carrier,
+                currentlyFlagged: "Yes",
+                dimension: "Blocked",
+                streakDays: streak,
+                streakStartDate,
+                latestFlaggedDate: streakEndDate,
+                lastSeenDate: parseYmd(lastSeenKey),
+                evidenceRowCount: evidence
+            });
+
+            const s = summaryMap.get(g.number)!;
+            s.currentlyBlockedCarriers.push(g.carrier);
+            s.currentlyBlockingCount = s.currentlyBlockedCarriers.length;
+            if (streak > s.longestCurrentBlockedStreakDays) s.longestCurrentBlockedStreakDays = streak;
         }
 
-        const streakEndDate = parseYmd(latestKey);
-        const streakStartKey = daysDesc.slice(0, streak).reverse()[0];
-        const streakStartDate = streakStartKey ? parseYmd(streakStartKey) : streakEndDate;
+        // ── LABELED: only if latest day is labeled
+        if (dsLatest.anyLabeled) {
+            let streak = 0;
+            let evidence = 0;
+            for (const k of daysDesc) {
+                const ds = byDate.get(k)!;
+                if (!ds.anyLabeled) break;
+                streak++;
+                evidence += ds.anyRowCount;
+            }
+            const streakEndDate = parseYmd(latestKey);
+            const streakStartKey = daysDesc.slice(0, streak).reverse()[0];
+            const streakStartDate = streakStartKey ? parseYmd(streakStartKey) : streakEndDate;
 
-        details.push({
-            number: g.number,
-            entity: latestRec.entity,
-            preferredBusinessName: latestRec.preferredBusinessName,
-            obnStatus: latestRec.obnStatus,
-            carrier: g.carrier,
-            currentlyBlocked: "Yes",
-            streakDays: streak,
-            streakStartDate,
-            latestBlockedDate: streakEndDate,
-            lastSeenDate: parseYmd(lastSeenKey),
-            evidenceRowCount: evidence
-        });
+            labeledDetails.push({
+                number: g.number,
+                entity: latestRec.entity,
+                preferredBusinessName: latestRec.preferredBusinessName,
+                obnStatus: latestRec.obnStatus,
+                carrier: g.carrier,
+                currentlyFlagged: "Yes",
+                dimension: "Labeled",
+                streakDays: streak,
+                streakStartDate,
+                latestFlaggedDate: streakEndDate,
+                lastSeenDate: parseYmd(lastSeenKey),
+                evidenceRowCount: evidence
+            });
 
-        const summ = summaryMap.get(g.number)!;
-        summ.currentlyBlockedCarriers.push(g.carrier);
-        summ.currentlyBlockingCount = summ.currentlyBlockedCarriers.length;
-        if (streak > summ.longestCurrentStreakDays) summ.longestCurrentStreakDays = streak;
+            const s = summaryMap.get(g.number)!;
+            s.currentlyLabeledCarriers.push(g.carrier);
+            s.currentlyLabeledCount = s.currentlyLabeledCarriers.length;
+            if (streak > s.longestCurrentLabeledStreakDays) s.longestCurrentLabeledStreakDays = streak;
+        }
     }
 
     // ── Output: Blocked Streaks (Excel TABLE with brand styling)
@@ -240,22 +290,53 @@ function main(workbook: ExcelScript.Workbook) {
         "Last Seen Date (any status)",
         "Evidence Rows (in streak)"
     ];
-    const detailRows = details.map((d): (string | number | boolean)[] => [
+    const blockedRows = blockedDetails.map((d): (string | number | boolean)[] => [
         d.number,
         d.entity,
         d.preferredBusinessName,
         d.obnStatus,
         d.carrier,
-        d.currentlyBlocked,
+        d.currentlyFlagged,
         d.streakDays,
         excelSerial(d.streakStartDate),
-        excelSerial(d.latestBlockedDate),
+        excelSerial(d.latestFlaggedDate),
         excelSerial(d.lastSeenDate),
         d.evidenceRowCount
     ]);
 
-    writeTableAsStyledTable(workbook, OUT_DETAIL_SHEET, detailHeaders, detailRows, BRAND);
-    formatColumns(workbook, OUT_DETAIL_SHEET, { dateCols: [8, 9, 10], intCols: [7, 11] });
+    writeTableAsStyledTable(workbook, OUT_BLOCKED_SHEET, detailHeaders, blockedRows, BRAND);
+    formatColumns(workbook, OUT_BLOCKED_SHEET, { dateCols: [8, 9, 10], intCols: [7, 11] });
+
+    // ── Output: Labeled Streaks (Excel TABLE with brand styling)
+    const labeledHeaders = [
+        "Number",
+        "Entity",
+        "Preferred Business Name",
+        "OBN Status",
+        "Carrier",
+        "Currently Labeled",
+        "Current Labeled Streak (test days)",
+        "Streak Start Date",
+        "Latest Labeled Date",
+        "Last Seen Date (any status)",
+        "Evidence Rows (in streak)"
+    ];
+    const labeledRows = labeledDetails.map((d): (string | number | boolean)[] => [
+        d.number,
+        d.entity,
+        d.preferredBusinessName,
+        d.obnStatus,
+        d.carrier,
+        d.currentlyFlagged,
+        d.streakDays,
+        excelSerial(d.streakStartDate),
+        excelSerial(d.latestFlaggedDate),
+        excelSerial(d.lastSeenDate),
+        d.evidenceRowCount
+    ]);
+
+    writeTableAsStyledTable(workbook, OUT_LABELED_SHEET, labeledHeaders, labeledRows, BRAND);
+    formatColumns(workbook, OUT_LABELED_SHEET, { dateCols: [8, 9, 10], intCols: [7, 11] });
 
     // ── Output: Summary by Number (Excel TABLE with brand styling)
     const summaryHeaders = [
@@ -265,7 +346,10 @@ function main(workbook: ExcelScript.Workbook) {
         "OBN Status",
         "Currently Blocking Carriers",
         "Currently Blocking (count)",
-        "Longest Current Streak (test days)"
+        "Longest Current Blocked Streak (test days)",
+        "Currently Labeled Carriers",
+        "Currently Labeled (count)",
+        "Longest Current Labeled Streak (test days)"
     ];
     const summaryRows = Array.from(summaryMap.values()).map((s): (string | number | boolean)[] => [
         s.number,
@@ -274,16 +358,21 @@ function main(workbook: ExcelScript.Workbook) {
         s.obnStatus ?? "",
         s.currentlyBlockedCarriers.join(", "),
         s.currentlyBlockingCount,
-        s.longestCurrentStreakDays
+        s.longestCurrentBlockedStreakDays,
+        s.currentlyLabeledCarriers.join(", "),
+        s.currentlyLabeledCount,
+        s.longestCurrentLabeledStreakDays
     ]);
 
     writeTableAsStyledTable(workbook, OUT_SUMMARY_SHEET, summaryHeaders, summaryRows, BRAND);
-    formatColumns(workbook, OUT_SUMMARY_SHEET, { intCols: [6, 7] });
+    formatColumns(workbook, OUT_SUMMARY_SHEET, { intCols: [6, 7, 9, 10] });
 
-    log(`Details rows written: ${detailRows.length}`);
+    log(`Blocked rows written: ${blockedRows.length}`);
+    log(`Labeled rows written: ${labeledRows.length}`);
     log(`Summary rows written: ${summaryRows.length}`);
     log('Filter applied: only rows with Test Status = "Success" were analyzed.');
     flushLogSheet(workbook, LOG_SHEET, logs);
+
     ws.activate();
 }
 
@@ -294,6 +383,7 @@ type CanonHeader =
     | "Carrier"
     | "Date"
     | "is_blocked"
+    | "is_labeled"
     | "Entity"
     | "OBN Status"
     | "Preferred Business Name"
@@ -304,6 +394,7 @@ type Rec = {
     carrier: string;
     date: Date;
     isBlocked: 0 | 1;
+    isLabeled: 0 | 1;
     entity: string;
     obnStatus: string;
     preferredBusinessName: string;
@@ -311,7 +402,12 @@ type Rec = {
 
 type Group = { number: string; carrier: string; rows: Rec[] };
 
-type DayStatus = { date: Date; anyBlocked: boolean; anyRowCount: number };
+type DayStatus = {
+    date: Date;
+    anyBlocked: boolean;
+    anyLabeled: boolean;
+    anyRowCount: number;
+};
 
 type DetailRow = {
     number: string;
@@ -319,10 +415,11 @@ type DetailRow = {
     preferredBusinessName: string;
     obnStatus: string;
     carrier: string;
-    currentlyBlocked: "Yes" | "No";
+    currentlyFlagged: "Yes" | "No";
+    dimension: "Blocked" | "Labeled";
     streakDays: number;
     streakStartDate: Date;
-    latestBlockedDate: Date;
+    latestFlaggedDate: Date;
     lastSeenDate: Date;
     evidenceRowCount: number;
 };
@@ -332,9 +429,17 @@ type SummaryRow = {
     entity?: string;
     obnStatus?: string;
     preferredBusinessName?: string;
+
+    // Blocked dimension
     currentlyBlockedCarriers: string[];
     currentlyBlockingCount: number;
-    longestCurrentStreakDays: number;
+    longestCurrentBlockedStreakDays: number;
+
+    // Labeled dimension
+    currentlyLabeledCarriers: string[];
+    currentlyLabeledCount: number;
+    longestCurrentLabeledStreakDays: number;
+
     _metaLastSeenMs: number; // internal latest-meta tracker
 };
 
@@ -390,9 +495,9 @@ function coerceDateOnly(v: unknown): Date | null {
     return null;
 }
 
-/** 1/"1"/true/"true" → 1; else → 0 */
-function normalizeBlocked(v: unknown): 0 | 1 {
-    return (v === 1 || v === "1" || v === true || v === "true") ? 1 : 0;
+/** Generic normalizer: 1/"1"/true/"true" → 1; else → 0 */
+function normalize01(v: unknown): 0 | 1 {
+    return (v === 1 || v === "1" || v === true || (typeof v === "string" && v.trim().toLowerCase() === "true")) ? 1 : 0;
 }
 
 /** Treat only text "success" (any case) as true. Everything else is false. */
@@ -448,7 +553,7 @@ function writeTableAsStyledTable(
     if (ws) ws.delete();
     ws = workbook.addWorksheet(sheetName);
 
-    // Write values
+    // Write values (avoid Date objects in setValues)
     const all: (string | number | boolean)[][] = [headers, ...(rows ?? [])];
     const rCount = all.length;
     const cCount = headers.length;
@@ -457,7 +562,8 @@ function writeTableAsStyledTable(
     // Create Table spanning the written range
     const lastCell = `${colToA1(cCount)}${rCount}`;
     const tbl = ws.addTable(`A1:${lastCell}`, true);
-    tbl.setPredefinedTableStyle(brand.tableStyle);
+    // Styling — use a built-in style name; keep booleans banded for readability
+    tbl.setPredefinedTableStyle(brand.tableStyle as unknown as ExcelScript.TableStyle);
     tbl.setShowBandedRows(true);
 
     // Apply brand fonts & colors in bulk
